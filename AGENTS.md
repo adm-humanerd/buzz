@@ -17,6 +17,8 @@ Before planning or reviewing a non-trivial change:
 4. Check that the proposed design advances, or at least does not contradict,
    that product intent. Call out any intentional tension explicitly.
 
+For mobile terminology, read [mobile/CONTEXT.md](mobile/CONTEXT.md).
+
 Implementation describes the product today; the vision documents describe the
 product it is becoming. A locally correct change can still be wrong if it works
 against that direction. Scale validation to the change's risk and exercise the
