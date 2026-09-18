@@ -3207,13 +3207,17 @@ async fn ingest_event_inner(
     // idempotent transaction also runs for duplicate requests: the event may
     // have been stored before a failure, including by an older relay version.
     let workflow_deletion = crate::handlers::side_effects::is_workflow_deletion(&event);
-    if workflow_deletion {
-        crate::handlers::side_effects::handle_side_effects(tenant, kind_u32, &event, state)
+    let workflow_deletion_changed = if workflow_deletion {
+        crate::handlers::side_effects::handle_a_tag_deletion(tenant, &event, state)
             .await
-            .map_err(|e| IngestError::Internal(format!("error: workflow deletion failed: {e}")))?;
-    }
+            .map_err(|e| IngestError::Internal(format!("error: workflow deletion failed: {e}")))?
+    } else {
+        false
+    };
 
-    if !was_inserted {
+    // A repaired deletion still needs the normal audit and live dispatch below.
+    // Completed duplicates remain no-ops, including channel-less/orphan repairs.
+    if !was_inserted && !workflow_deletion_changed {
         return Ok(IngestResult {
             event_id: event_id_hex,
             accepted: true,

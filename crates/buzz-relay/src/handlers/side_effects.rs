@@ -2111,11 +2111,12 @@ pub(crate) fn is_workflow_deletion(event: &Event) -> bool {
 
 /// Handle NIP-09 deletion via `a` tag (addressable/parameterized-replaceable events).
 /// Parses "kind:pubkey:d-tag" and deletes the corresponding DB record.
-async fn handle_a_tag_deletion(
+/// Returns whether a workflow deletion changed state, for duplicate repair dispatch.
+pub(crate) async fn handle_a_tag_deletion(
     tenant: &TenantContext,
     event: &Event,
     state: &Arc<AppState>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let a_value = event
         .tags
         .iter()
@@ -2143,7 +2144,7 @@ async fn handle_a_tag_deletion(
             // not necessarily the signer of the deletion request.
             let owner_bytes = hex::decode(pubkey_hex)
                 .map_err(|_| anyhow::anyhow!("invalid pubkey hex in workflow coordinate"))?;
-            let channel_id = state
+            let outcome = state
                 .db
                 .delete_workflow_by_coordinate(
                     tenant.community(),
@@ -2152,11 +2153,12 @@ async fn handle_a_tag_deletion(
                     event.created_at.as_secs() as i64,
                 )
                 .await?;
-            if let Some(channel_id) = channel_id {
+            if let Some(channel_id) = outcome.channel_id {
                 state
                     .workflow_engine
                     .invalidate_channel_workflows(tenant.community(), channel_id);
             }
+            return Ok(outcome.changed);
         }
         // Other NIP-33 events have no executable workflow projection.
         k if is_parameterized_replaceable(k) => {
@@ -2211,7 +2213,7 @@ async fn handle_a_tag_deletion(
         }
     }
 
-    Ok(())
+    Ok(false)
 }
 
 async fn handle_standard_deletion_event(
@@ -2224,7 +2226,9 @@ async fn handle_standard_deletion_event(
         // NIP-09 a-tag deletion path for addressable events. Keyed on the
         // absence of *any* e tag (not just valid e-ids): a malformed e + a must
         // not route here and silently soft-delete the coordinate.
-        return handle_a_tag_deletion(tenant, event, state).await;
+        return handle_a_tag_deletion(tenant, event, state)
+            .await
+            .map(|_| ());
     }
 
     for target_id in target_ids {

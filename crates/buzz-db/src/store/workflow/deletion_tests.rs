@@ -100,14 +100,16 @@ async fn workflow_deletion_removes_both_projections_and_is_scoped_and_retryable(
     let other_query = seed(&db, other, &keys, id, &d_tag, now).await;
     assert_present(&db, &query, id).await;
 
-    db.delete_workflow_by_coordinate(
-        community,
-        &Keys::generate().public_key().to_bytes(),
-        &d_tag,
-        now as i64,
-    )
-    .await
-    .expect("wrong owner is a no-op");
+    let unchanged = db
+        .delete_workflow_by_coordinate(
+            community,
+            &Keys::generate().public_key().to_bytes(),
+            &d_tag,
+            now as i64,
+        )
+        .await
+        .expect("wrong owner is a no-op");
+    assert!(!unchanged.changed);
     assert_present(&db, &query, id).await;
 
     let run_id = create_workflow_run(&db.pool, community, id, None, None)
@@ -125,18 +127,32 @@ async fn workflow_deletion_removes_both_projections_and_is_scoped_and_retryable(
     .execute(&db.pool)
     .await
     .expect("scheduled claim linked to run");
-    db.delete_workflow_by_coordinate(community, &owner, &d_tag, now as i64)
-        .await
-        .expect("delete workflow");
+    let (first, second) = tokio::join!(
+        db.delete_workflow_by_coordinate(community, &owner, &d_tag, now as i64),
+        db.delete_workflow_by_coordinate(community, &owner, &d_tag, now as i64),
+    );
+    let first = first.expect("first deletion");
+    let second = second.expect("concurrent deletion");
+    assert_ne!(
+        first.changed, second.changed,
+        "only one deletion changes state"
+    );
+    assert_eq!(
+        first.channel_id, None,
+        "channel-less mutation still reports change"
+    );
+    assert_eq!(second.channel_id, None);
     assert_absent(&db, &query, id).await;
     assert_present(&db, &other_query, id).await;
     assert!(matches!(
         db.get_workflow_run(community, run_id).await,
         Err(DbError::NotFound(_))
     ));
-    db.delete_workflow_by_coordinate(community, &owner, &d_tag, now as i64)
+    let unchanged = db
+        .delete_workflow_by_coordinate(community, &owner, &d_tag, now as i64)
         .await
         .expect("repeat deletion");
+    assert!(!unchanged.changed);
     assert_absent(&db, &query, id).await;
 }
 
@@ -150,9 +166,11 @@ async fn workflow_deletion_preserves_newer_definition_and_cleans_legacy_orphan()
     let d_tag = id.to_string();
     let now = Timestamp::now().as_secs();
     let query = seed(&db, community, &keys, id, &d_tag, now).await;
-    db.delete_workflow_by_coordinate(community, &owner, &d_tag, now as i64 - 1)
+    let unchanged = db
+        .delete_workflow_by_coordinate(community, &owner, &d_tag, now as i64 - 1)
         .await
         .expect("stale deletion");
+    assert!(!unchanged.changed);
     assert_present(&db, &query, id).await;
 
     // Old relay releases deleted the executable row, but not the definition.
@@ -166,16 +184,30 @@ async fn workflow_deletion_preserves_newer_definition_and_cleans_legacy_orphan()
             .len(),
         1
     );
-    db.delete_workflow_by_coordinate(community, &owner, &d_tag, now as i64)
+    let repaired = db
+        .delete_workflow_by_coordinate(community, &owner, &d_tag, now as i64)
         .await
         .expect("repair deletion");
+    assert!(repaired.changed, "orphan-only cleanup must dispatch");
+    assert_eq!(repaired.channel_id, None);
     assert_absent(&db, &query, id).await;
 
     let legacy_id = Uuid::new_v4();
     let legacy = seed(&db, community, &keys, legacy_id, "legacy-name", now).await;
-    db.delete_workflow_by_coordinate(community, &owner, "legacy-name", now as i64)
+    db.soft_delete_by_coordinate(
+        community,
+        KIND_WORKFLOW_DEF as i32,
+        &owner,
+        "legacy-name",
+        now as i64,
+    )
+    .await
+    .expect("remove definition to leave only executable projection");
+    let repaired = db
+        .delete_workflow_by_coordinate(community, &owner, "legacy-name", now as i64)
         .await
         .expect("name coordinate deletion");
+    assert!(repaired.changed, "projection-only cleanup must dispatch");
     assert_absent(&db, &legacy, legacy_id).await;
 }
 

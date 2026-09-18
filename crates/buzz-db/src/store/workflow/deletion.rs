@@ -8,13 +8,23 @@ use uuid::Uuid;
 
 use crate::{Db, DbError, Result};
 
+/// Committed changes made by a workflow-coordinate deletion.
+#[derive(Debug, Default)]
+pub struct WorkflowDeletionOutcome {
+    /// Whether either the executable workflow or a visible definition was removed.
+    pub changed: bool,
+    /// Removed executable workflow's channel, for trigger-cache invalidation.
+    pub channel_id: Option<Uuid>,
+}
+
 impl Db {
     /// Delete an authorized workflow coordinate and its definition atomically.
     ///
     /// Shares the replacement lock with definition saves. A deletion older than
     /// the live definition is a no-op. Missing projections are tolerated so a
     /// retry can remove definitions left behind by older relay versions.
-    /// Returns the removed projection's channel for trigger-cache invalidation.
+    /// Reports committed changes independently of the optional workflow channel.
+    /// No tombstone is retained: clients may intentionally publish backdated definitions.
     #[datastore_span(name = "delete_workflow_by_coordinate", system = "postgresql")]
     pub async fn delete_workflow_by_coordinate(
         &self,
@@ -22,7 +32,7 @@ impl Db {
         owner_pubkey: &[u8],
         d_tag: &str,
         deletion_created_at_secs: i64,
-    ) -> Result<Option<Uuid>> {
+    ) -> Result<WorkflowDeletionOutcome> {
         let cutoff = DateTime::from_timestamp(deletion_created_at_secs, 0)
             .ok_or(DbError::InvalidTimestamp(deletion_created_at_secs))?;
         let mut tx = self.begin_event_write_transaction().await?;
@@ -52,7 +62,7 @@ impl Db {
         .fetch_optional(&mut *tx)
         .await?;
         if head.is_some_and(|created_at| created_at > cutoff) {
-            return Ok(None);
+            return Ok(WorkflowDeletionOutcome::default());
         }
 
         // UUID coordinates are canonical; retain the legacy name-based path.
@@ -70,7 +80,7 @@ impl Db {
         .bind(d_tag)
         .fetch_optional(&mut *tx)
         .await?;
-        sqlx::query(
+        let definitions = sqlx::query(
             "UPDATE events SET deleted_at = NOW() WHERE community_id = $1 AND kind = $2 \
              AND pubkey = $3 AND d_tag = $4 AND deleted_at IS NULL AND created_at <= $5",
         )
@@ -81,12 +91,16 @@ impl Db {
         .bind(cutoff)
         .execute(&mut *tx)
         .await?;
+        let changed = row.is_some() || definitions.rows_affected() > 0;
         let channel_id = row
             .map(|row| row.try_get("channel_id"))
             .transpose()?
             .flatten();
         tx.commit().await?;
-        Ok(channel_id)
+        Ok(WorkflowDeletionOutcome {
+            changed,
+            channel_id,
+        })
     }
 }
 

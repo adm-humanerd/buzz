@@ -12,9 +12,9 @@
 use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
-use buzz_test_client::BuzzTestClient;
+use buzz_test_client::{BuzzTestClient, RelayMessage, TestClientError};
 use futures_util::FutureExt;
-use nostr::{Alphabet, Event, EventBuilder, Filter, Keys, Kind, SingleLetterTag, Tag};
+use nostr::{Alphabet, Event, EventBuilder, Filter, Keys, Kind, SingleLetterTag, Tag, Timestamp};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -159,13 +159,8 @@ async fn create_channel(client: &mut BuzzTestClient, keys: &Keys, channel_id: &s
     );
 }
 
-async fn create_workflow(
-    client: &mut BuzzTestClient,
-    keys: &Keys,
-    channel_id: &str,
-    workflow_id: &str,
-) -> nostr::EventId {
-    let definition = EventBuilder::new(
+fn workflow_definition(channel_id: &str, workflow_id: &str) -> EventBuilder {
+    EventBuilder::new(
         Kind::Custom(KIND_WORKFLOW_DEFINITION),
         "name: deletion-regression\ntrigger:\n  on: message_posted\nsteps:\n  - id: pause\n    action: delay\n    duration: 1s\n",
     )
@@ -173,8 +168,17 @@ async fn create_workflow(
         Tag::parse(["d", workflow_id]).expect("workflow d tag"),
         Tag::parse(["h", channel_id]).expect("workflow h tag"),
     ])
-    .sign_with_keys(keys)
-    .expect("sign workflow definition");
+}
+
+async fn create_workflow(
+    client: &mut BuzzTestClient,
+    keys: &Keys,
+    channel_id: &str,
+    workflow_id: &str,
+) -> nostr::EventId {
+    let definition = workflow_definition(channel_id, workflow_id)
+        .sign_with_keys(keys)
+        .expect("sign workflow definition");
     let definition_id = definition.id;
     let created = client
         .send_event(definition)
@@ -197,6 +201,81 @@ fn workflow_deletion(keys: &Keys, workflow_id: &str) -> Event {
         .tags([Tag::parse(["a", coordinate.as_str()]).expect("workflow coordinate")])
         .sign_with_keys(keys)
         .expect("sign workflow deletion")
+}
+
+async fn assert_trigger_rejected(client: &mut BuzzTestClient, keys: &Keys, workflow_id: &str) {
+    let trigger = EventBuilder::new(Kind::Custom(KIND_WORKFLOW_TRIGGER), "{}")
+        .tags([Tag::parse(["d", workflow_id]).expect("trigger d tag")])
+        .sign_with_keys(keys)
+        .expect("sign workflow trigger");
+    let triggered = client
+        .send_event(trigger)
+        .await
+        .expect("submit post-deletion trigger");
+    assert!(!triggered.accepted, "deleted workflow remained triggerable");
+    assert!(
+        triggered.message.contains("workflow not found"),
+        "unexpected post-deletion trigger rejection: {}",
+        triggered.message
+    );
+}
+
+async fn assert_no_live_deletion(listener: &mut BuzzTestClient) {
+    assert!(
+        matches!(
+            listener.recv_event(Duration::from_millis(300)).await,
+            Err(TestClientError::Timeout)
+        ),
+        "rejected/completed duplicate deletion must not be delivered"
+    );
+}
+
+async fn assert_live_event(listener: &mut BuzzTestClient, subscription: &str, expected: &Event) {
+    match listener
+        .recv_event(Duration::from_secs(5))
+        .await
+        .expect("receive live event")
+    {
+        RelayMessage::Event {
+            subscription_id,
+            event,
+        } => {
+            assert_eq!(subscription_id, subscription);
+            assert_eq!(*event, *expected, "dispatch the exact signed event");
+        }
+        other => panic!("expected live event, got {other:?}"),
+    }
+}
+
+async fn audit_count(pool: &PgPool, event: &Event) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE object_id = $1 AND action = 'event_created' AND actor_pubkey = $2 AND detail->>'event_kind' = $3")
+        .bind(event.id.to_hex())
+        .bind(event.pubkey.to_bytes().to_vec())
+        .bind(event.kind.as_u16().to_string())
+        .fetch_one(pool).await.expect("count event audit entries")
+}
+
+async fn flush_audit(client: &mut BuzzTestClient, keys: &Keys, pool: &PgPool) -> Event {
+    // Audit enqueue is awaited before OK. A later marker in the same relay's
+    // FIFO audit queue gives a causal flush fence instead of an arbitrary sleep.
+    let marker = EventBuilder::new(Kind::TextNote, Uuid::new_v4().to_string())
+        .sign_with_keys(keys)
+        .expect("sign audit fence");
+    assert!(
+        client
+            .send_event(marker.clone())
+            .await
+            .expect("publish audit fence")
+            .accepted
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while audit_count(pool, &marker).await == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("audit worker must persist fence");
+    marker
 }
 
 #[tokio::test]
@@ -234,20 +313,7 @@ async fn deleting_workflow_removes_definition_and_rejects_manual_trigger() {
         "deleted workflow definition remained queryable: {after:?}"
     );
 
-    let trigger = EventBuilder::new(Kind::Custom(KIND_WORKFLOW_TRIGGER), "{}")
-        .tags([Tag::parse(["d", workflow_id.as_str()]).expect("trigger d tag")])
-        .sign_with_keys(&keys)
-        .expect("sign workflow trigger");
-    let triggered = client
-        .send_event(trigger)
-        .await
-        .expect("submit post-deletion trigger");
-    assert!(!triggered.accepted, "deleted workflow remained triggerable");
-    assert!(
-        triggered.message.contains("workflow not found"),
-        "unexpected post-deletion trigger rejection: {}",
-        triggered.message
-    );
+    assert_trigger_rejected(&mut client, &keys, &workflow_id).await;
 
     client.disconnect().await.expect("disconnect");
 }
@@ -271,6 +337,24 @@ async fn run_failed_deletion_replay_scenario(pool: &PgPool) {
 
     let deletion = workflow_deletion(&keys, &workflow_id_text);
     let deletion_id = deletion.id;
+    let mut listener = BuzzTestClient::connect(&relay_url(), &keys)
+        .await
+        .expect("connect live listener");
+    let subscription = sub_id("live-deletion");
+    listener
+        .subscribe(
+            &subscription,
+            vec![Filter::new()
+                .kinds([Kind::EventDeletion, Kind::TextNote])
+                .author(keys.public_key())],
+        )
+        .await
+        .expect("subscribe before failure");
+    assert!(listener
+        .collect_until_eose(&subscription, Duration::from_secs(5))
+        .await
+        .expect("establish live subscription")
+        .is_empty());
     let mut injector = FailureInjector::install(pool.clone(), &keys, workflow_id).await;
     let rejected = client
         .send_event(deletion.clone())
@@ -282,6 +366,14 @@ async fn run_failed_deletion_replay_scenario(pool: &PgPool) {
     );
     // WebSocket ingestion deliberately redacts internal database errors.
     assert_eq!(rejected.message, "error: internal server error");
+    let marker = flush_audit(&mut client, &keys, pool).await;
+    assert_live_event(&mut listener, &subscription, &marker).await;
+    assert_no_live_deletion(&mut listener).await;
+    assert_eq!(
+        audit_count(pool, &deletion).await,
+        0,
+        "failed deletion must not be audited as accepted"
+    );
 
     assert_eq!(
         database_representation_counts(pool, &keys, workflow_id).await,
@@ -295,9 +387,18 @@ async fn run_failed_deletion_replay_scenario(pool: &PgPool) {
         "definition disappeared after rejected deletion"
     );
 
+    let stored_requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE id = $1")
+        .bind(deletion_id.to_bytes().to_vec())
+        .fetch_one(pool)
+        .await
+        .expect("count stored deletion");
+    assert_eq!(
+        stored_requests, 1,
+        "retry must exercise an already-persisted request"
+    );
     injector.remove().await;
     let replayed = client
-        .send_event(deletion)
+        .send_event(deletion.clone())
         .await
         .expect("replay identical signed deletion");
     assert!(
@@ -306,10 +407,13 @@ async fn run_failed_deletion_replay_scenario(pool: &PgPool) {
         replayed.message
     );
     assert_eq!(replayed.event_id, deletion_id.to_hex());
-    assert!(
-        replayed.message.starts_with("duplicate:"),
-        "replay did not exercise duplicate-ingest path: {}",
-        replayed.message
+    assert_live_event(&mut listener, &subscription, &deletion).await;
+    let marker = flush_audit(&mut client, &keys, pool).await;
+    assert_live_event(&mut listener, &subscription, &marker).await;
+    assert_eq!(
+        audit_count(pool, &deletion).await,
+        1,
+        "repair must enqueue normal audit exactly once"
     );
     assert_eq!(
         database_representation_counts(pool, &keys, workflow_id).await,
@@ -322,6 +426,21 @@ async fn run_failed_deletion_replay_scenario(pool: &PgPool) {
             .is_empty(),
         "definition remained queryable after successful replay"
     );
+    assert_trigger_rejected(&mut client, &keys, &workflow_id_text).await;
+    let duplicate = client
+        .send_event(deletion.clone())
+        .await
+        .expect("repeat completed deletion");
+    assert!(duplicate.accepted && duplicate.message.starts_with("duplicate:"));
+    let marker = flush_audit(&mut client, &keys, pool).await;
+    assert_live_event(&mut listener, &subscription, &marker).await;
+    assert_no_live_deletion(&mut listener).await;
+    assert_eq!(
+        audit_count(pool, &deletion).await,
+        1,
+        "completed duplicate must not re-audit"
+    );
+    listener.disconnect().await.expect("disconnect listener");
     client.disconnect().await.expect("disconnect");
 }
 
@@ -349,4 +468,58 @@ async fn failed_workflow_deletion_rolls_back_and_identical_event_can_be_replayed
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }
+}
+
+#[tokio::test]
+#[ignore]
+async fn workflow_can_be_intentionally_recreated_with_a_backdated_definition() {
+    let keys = Keys::generate();
+    let channel_id = Uuid::new_v4().to_string();
+    let workflow_id = Uuid::new_v4();
+    let workflow_id_text = workflow_id.to_string();
+    let mut client = BuzzTestClient::connect(&relay_url(), &keys)
+        .await
+        .expect("connect");
+    create_channel(&mut client, &keys, &channel_id).await;
+    create_workflow(&mut client, &keys, &channel_id, &workflow_id_text).await;
+    let deletion = workflow_deletion(&keys, &workflow_id_text);
+    let backdated = workflow_definition(&channel_id, &workflow_id_text)
+        .custom_created_at(Timestamp::from(deletion.created_at.as_secs() - 60))
+        .sign_with_keys(&keys)
+        .expect("sign intentional backdated recreation");
+    assert!(client.send_event(deletion).await.expect("delete").accepted);
+    assert!(query_definition(&mut client, &keys, &workflow_id_text)
+        .await
+        .is_empty());
+    let recreated = client
+        .send_event(backdated.clone())
+        .await
+        .expect("recreate backdated workflow");
+    assert!(
+        recreated.accepted,
+        "backdating is intentional: {}",
+        recreated.message
+    );
+    let definitions = query_definition(&mut client, &keys, &workflow_id_text).await;
+    assert_eq!(definitions.len(), 1);
+    assert_eq!(definitions[0].id, backdated.id);
+    let pool = PgPool::connect(&database_url())
+        .await
+        .expect("isolated database");
+    assert_eq!(
+        database_representation_counts(&pool, &keys, workflow_id).await,
+        (1, 1)
+    );
+    let trigger = EventBuilder::new(Kind::Custom(KIND_WORKFLOW_TRIGGER), "{}")
+        .tags([Tag::parse(["d", workflow_id_text.as_str()]).expect("trigger coordinate")])
+        .sign_with_keys(&keys)
+        .expect("sign recreated workflow trigger");
+    assert!(
+        client
+            .send_event(trigger)
+            .await
+            .expect("trigger recreated workflow")
+            .accepted
+    );
+    client.disconnect().await.expect("disconnect");
 }
