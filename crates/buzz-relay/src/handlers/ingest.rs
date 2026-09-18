@@ -3203,6 +3203,16 @@ async fn ingest_event_inner(
         }
     };
 
+    // Workflow deletion must not acknowledge a failed domain mutation. Its
+    // idempotent transaction also runs for duplicate requests: the event may
+    // have been stored before a failure, including by an older relay version.
+    let workflow_deletion = crate::handlers::side_effects::is_workflow_deletion(&event);
+    if workflow_deletion {
+        crate::handlers::side_effects::handle_side_effects(tenant, kind_u32, &event, state)
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: workflow deletion failed: {e}")))?;
+    }
+
     if !was_inserted {
         return Ok(IngestResult {
             event_id: event_id_hex,
@@ -3211,7 +3221,7 @@ async fn ingest_event_inner(
         });
     }
 
-    if crate::handlers::side_effects::is_side_effect_kind(kind_u32) {
+    if !workflow_deletion && crate::handlers::side_effects::is_side_effect_kind(kind_u32) {
         if let Err(e) =
             crate::handlers::side_effects::handle_side_effects(tenant, kind_u32, &event, state)
                 .await

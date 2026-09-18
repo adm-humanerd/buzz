@@ -7,6 +7,8 @@
 //! - Approval tokens are stored as SHA-256 hashes (never plaintext).
 //! - All list queries have a bounded LIMIT to prevent unbounded scans.
 
+mod deletion;
+
 use std::fmt;
 use std::str::FromStr;
 
