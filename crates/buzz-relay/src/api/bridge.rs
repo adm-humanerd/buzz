@@ -21,13 +21,53 @@ use crate::state::AppState;
 
 use super::{api_error, internal_error, not_found};
 
+/// Route-specific HTTP admission category.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum HttpAdmissionRoute {
+    /// Only the shared HTTP API ceiling applies.
+    SharedOnly,
+    /// Only the shared ceiling applies before GIF request validation.
+    GifSearchPreflight,
+    /// `POST /events`.
+    Events,
+    /// `POST /query`.
+    Query,
+    /// `POST /count`.
+    Count,
+    /// `POST /gifs/search`.
+    GifSearch,
+}
+
+impl HttpAdmissionRoute {
+    fn path(self) -> &'static str {
+        match self {
+            Self::SharedOnly => "/api",
+            Self::GifSearchPreflight | Self::GifSearch => "/gifs/search",
+            Self::Events => "/events",
+            Self::Query => "/query",
+            Self::Count => "/count",
+        }
+    }
+
+    fn limit_type(self) -> Option<LimitType> {
+        match self {
+            Self::SharedOnly | Self::GifSearchPreflight => None,
+            Self::Events => Some(LimitType::ApiEvents),
+            Self::Query => Some(LimitType::ApiQueries),
+            Self::Count => Some(LimitType::ApiCounts),
+            Self::GifSearch => Some(LimitType::GifSearches),
+        }
+    }
+}
+
 pub(crate) async fn enforce_http_admission(
     state: &AppState,
     tenant: &TenantContext,
     pubkey: &nostr::PublicKey,
+    route: HttpAdmissionRoute,
 ) -> Result<(), (StatusCode, Json<Value>)> {
     let limit = state.auth.config().rate_limits.human_api_calls_per_min;
-    match crate::admission::check_principal(
+    let global_result = crate::admission::check_principal(
         state.admission_rate_limiter.as_ref(),
         tenant,
         pubkey,
@@ -35,22 +75,112 @@ pub(crate) async fn enforce_http_admission(
         60,
         limit,
     )
+    .await;
+    if let Err(error) = global_result {
+        return Err(http_admission_error(state, tenant, pubkey, route, error));
+    }
+
+    let Some(route_limit_type) = route.limit_type() else {
+        return Ok(());
+    };
+    enforce_http_route_admission_with_limit(state, tenant, pubkey, route, limit, route_limit_type)
+        .await
+}
+
+/// Enforce the configured per-route HTTP quota without consuming the shared
+/// global API counter. Used where request validation must happen first.
+pub(crate) async fn enforce_http_route_admission(
+    state: &AppState,
+    tenant: &TenantContext,
+    pubkey: &nostr::PublicKey,
+    route: HttpAdmissionRoute,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let Some(route_limit_type) = route.limit_type() else {
+        return Ok(());
+    };
+    let global_limit = state.auth.config().rate_limits.human_api_calls_per_min;
+    enforce_http_route_admission_with_limit(
+        state,
+        tenant,
+        pubkey,
+        route,
+        global_limit,
+        route_limit_type,
+    )
     .await
-    {
-        Ok(()) => Ok(()),
-        Err(crate::admission::AdmissionError::Exceeded { reset_in_secs }) => {
+}
+
+async fn enforce_http_route_admission_with_limit(
+    state: &AppState,
+    tenant: &TenantContext,
+    pubkey: &nostr::PublicKey,
+    route: HttpAdmissionRoute,
+    global_limit: u64,
+    route_limit_type: LimitType,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let route_limit = if matches!(route, HttpAdmissionRoute::GifSearch) {
+        state.auth.config().rate_limits.gif_searches_per_min
+    } else {
+        global_limit
+    };
+    let route_result = crate::admission::check_principal(
+        state.admission_rate_limiter.as_ref(),
+        tenant,
+        pubkey,
+        route_limit_type,
+        60,
+        route_limit,
+    )
+    .await;
+    if let Err(error) = route_result {
+        return Err(http_admission_error(state, tenant, pubkey, route, error));
+    }
+    Ok(())
+}
+
+fn http_admission_error(
+    state: &AppState,
+    tenant: &TenantContext,
+    pubkey: &nostr::PublicKey,
+    route: HttpAdmissionRoute,
+    error: crate::admission::AdmissionError,
+) -> (StatusCode, Json<Value>) {
+    match error {
+        crate::admission::AdmissionError::Exceeded {
+            current,
+            limit,
+            reset_in_secs,
+        } => {
             metrics::counter!("buzz_admission_rejections_total", "transport" => "http", "reason" => "quota").increment(1);
-            Err(api_error(
-                StatusCode::TOO_MANY_REQUESTS,
-                &format!("rate-limited: quota exceeded; retry in {reset_in_secs}s"),
-            ))
+            if matches!(route, HttpAdmissionRoute::GifSearch) {
+                metrics::counter!("buzz_gif_search_rejections_total", "reason" => "quota")
+                    .increment(1);
+            }
+            crate::admission::audit_rate_limit_exceeded(
+                state,
+                tenant,
+                pubkey,
+                crate::admission::RateLimitAudit {
+                    route: route.path(),
+                    transport: "http",
+                    current,
+                    limit,
+                    reset_in_secs,
+                },
+            );
+            let message = if matches!(route, HttpAdmissionRoute::GifSearch) {
+                format!("rate-limited: GIF search quota exceeded; retry in {reset_in_secs}s")
+            } else {
+                format!("rate-limited: quota exceeded; retry in {reset_in_secs}s")
+            };
+            api_error(StatusCode::TOO_MANY_REQUESTS, &message)
         }
-        Err(crate::admission::AdmissionError::Unavailable) => {
+        crate::admission::AdmissionError::Unavailable => {
             metrics::counter!("buzz_admission_rejections_total", "transport" => "http", "reason" => "unavailable").increment(1);
-            Err(api_error(
+            api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "rate-limited: shared admission unavailable",
-            ))
+            )
         }
     }
 }
@@ -881,7 +1011,8 @@ async fn submit_event_authed(
 ) -> SubmitOutcome {
     // Admission and replay checks fire before body parse — a 429 or replay
     // reject on a malformed body must still be attributed.
-    if let Err(e) = enforce_http_admission(state, tenant, &pubkey).await {
+    if let Err(e) = enforce_http_admission(state, tenant, &pubkey, HttpAdmissionRoute::Events).await
+    {
         return SubmitOutcome::Err {
             status: e.0,
             response: e,
@@ -1095,7 +1226,7 @@ async fn query_events_authed(
     event_id_bytes: [u8; 32],
     signed_auth_created_at: Option<u64>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    enforce_http_admission(state, tenant, &pubkey).await?;
+    enforce_http_admission(state, tenant, &pubkey, HttpAdmissionRoute::Query).await?;
     check_nip98_replay(state, tenant, event_id_bytes).await?;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
@@ -1636,7 +1767,7 @@ async fn count_events_authed(
     event_id_bytes: [u8; 32],
     signed_auth_created_at: Option<u64>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    enforce_http_admission(state, tenant, &pubkey).await?;
+    enforce_http_admission(state, tenant, &pubkey, HttpAdmissionRoute::Count).await?;
     check_nip98_replay(state, tenant, event_id_bytes).await?;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
@@ -2555,6 +2686,32 @@ mod postgres_tests {
             .expect("sign auth event")
             .id
             .to_bytes()
+    }
+
+    #[test]
+    fn bridge_admission_routes_map_to_distinct_limit_types() {
+        assert_eq!(
+            HttpAdmissionRoute::Events.limit_type(),
+            Some(LimitType::ApiEvents)
+        );
+        assert_eq!(
+            HttpAdmissionRoute::Query.limit_type(),
+            Some(LimitType::ApiQueries)
+        );
+        assert_eq!(
+            HttpAdmissionRoute::Count.limit_type(),
+            Some(LimitType::ApiCounts)
+        );
+        assert_eq!(
+            HttpAdmissionRoute::GifSearch.limit_type(),
+            Some(LimitType::GifSearches)
+        );
+        assert_eq!(HttpAdmissionRoute::SharedOnly.limit_type(), None);
+        assert_eq!(HttpAdmissionRoute::GifSearchPreflight.limit_type(), None);
+        assert_eq!(
+            HttpAdmissionRoute::GifSearchPreflight.path(),
+            "/gifs/search"
+        );
     }
 
     #[test]

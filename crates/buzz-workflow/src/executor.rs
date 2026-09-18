@@ -10,11 +10,17 @@
 //! Real event emission is wired in WF-07/08 (relay integration).
 
 use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use buzz_core::tenant::CommunityId;
+use chrono::{DateTime, Duration, Utc};
 use evalexpr::HashMapContext;
 use nostr::ToBech32;
 use serde_json::Value as JsonValue;
+use tokio::sync::{oneshot, Notify};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -476,11 +482,24 @@ pub enum StepResult {
     Completed(JsonValue),
     /// Step requests suspension (approval gate). Execution must pause.
     Suspended {
-        /// Token used to resume or reject this approval gate.
-        approval_token: String,
+        /// Approval metadata used to persist and later resume this gate.
+        approval: ApprovalRequest,
     },
     /// Step was skipped due to `if:` condition being false.
     Skipped,
+}
+
+/// Durable metadata for an approval gate that suspended execution.
+#[derive(Debug, Clone)]
+pub struct ApprovalRequest {
+    /// Raw token returned to the command/event layer. It is never persisted.
+    pub token: String,
+    /// Step that requested the approval.
+    pub step_id: String,
+    /// User or role allowed to approve.
+    pub approver_spec: String,
+    /// Absolute expiry timestamp for the approval request.
+    pub expires_at: DateTime<Utc>,
 }
 
 fn resolve_send_message_channel(
@@ -728,6 +747,19 @@ pub async fn dispatch_action(
                     timeout,
                 } => {
                     let timeout_str = timeout.as_deref().unwrap_or("24h");
+                    let timeout_secs = approval_timeout_secs(timeout.as_deref())?;
+                    let timeout_i64 = i64::try_from(timeout_secs).map_err(|_| {
+                        WorkflowError::InvalidDefinition(format!(
+                            "approval timeout is too large: {timeout_str}"
+                        ))
+                    })?;
+                    let expires_at = Utc::now()
+                        .checked_add_signed(Duration::seconds(timeout_i64))
+                        .ok_or_else(|| {
+                            WorkflowError::InvalidDefinition(format!(
+                                "approval timeout is too large: {timeout_str}"
+                            ))
+                        })?;
                     info!(
                         run_id = %run_id, step = step_id,
                         "RequestApproval from={from} timeout={timeout_str}: {message}"
@@ -735,11 +767,13 @@ pub async fn dispatch_action(
 
                     let token = generate_approval_token(run_id, step_id);
 
-                    // TODO (WF-08): create approval record in DB, emit kind:46010.
-                    // For now, return Suspended with the token so the caller can persist state.
-
                     Ok(StepResult::Suspended {
-                        approval_token: token,
+                        approval: ApprovalRequest {
+                            token,
+                            step_id: step_id.to_owned(),
+                            approver_spec: from.to_owned(),
+                            expires_at,
+                        },
                     })
                 }
 
@@ -790,6 +824,23 @@ pub async fn dispatch_action(
 /// sufficient and avoids the predictability of time-based entropy.
 fn generate_approval_token(_run_id: Uuid, _step_id: &str) -> String {
     Uuid::new_v4().to_string()
+}
+
+/// Resolve and validate the timeout for an approval request.
+pub(crate) fn approval_timeout_secs(timeout: Option<&str>) -> Result<u64, WorkflowError> {
+    let value = timeout.unwrap_or("24h");
+    let secs = parse_duration_secs(value)?;
+    if secs == 0 {
+        return Err(WorkflowError::InvalidDefinition(
+            "approval timeout must be greater than zero".into(),
+        ));
+    }
+    if secs > i64::MAX as u64 {
+        return Err(WorkflowError::InvalidDefinition(
+            "approval timeout is too large".into(),
+        ));
+    }
+    Ok(secs)
 }
 
 /// Parse a duration string like "5m", "1h", "30s" into seconds.
@@ -1035,13 +1086,92 @@ async fn add_reaction_impl(message_id: &str, emoji: &str) -> Result<JsonValue, W
 pub struct ExecutionResult {
     /// Set when execution suspended at a `RequestApproval` step.
     /// `None` means the run completed normally.
-    pub approval_token: Option<String>,
+    pub approval: Option<ApprovalRequest>,
     /// Index of the step that suspended (or the total step count on completion).
     pub step_index: usize,
     /// Accumulated step outputs at the point of suspension or completion.
     pub step_outputs: HashMap<String, JsonValue>,
     /// Execution trace: one entry per completed/skipped step.
     pub trace: Vec<JsonValue>,
+    /// Fence held by the worker that produced this result.
+    pub claim_token: Uuid,
+}
+
+/// Renews a run lease while a workflow step is active.
+struct LeaseHeartbeat {
+    lost: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+    stop: Option<oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl LeaseHeartbeat {
+    async fn start(
+        engine: &WorkflowEngine,
+        community_id: CommunityId,
+        run_id: Uuid,
+        claim_token: Uuid,
+    ) -> Self {
+        let lost = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(Notify::new());
+        let (stop_tx, mut stop_rx) = oneshot::channel();
+        let task_lost = Arc::clone(&lost);
+        let task_notify = Arc::clone(&notify);
+        let db = engine.db.clone();
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    _ = interval.tick() => {
+                        match db.renew_workflow_run_lease(community_id, run_id, claim_token).await {
+                            Ok(true) => {}
+                            Ok(false) | Err(_) => {
+                                task_lost.store(true, Ordering::Release);
+                                task_notify.notify_waiters();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            lost,
+            notify,
+            stop: Some(stop_tx),
+            task: Some(task),
+        }
+    }
+
+    fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::Acquire)
+    }
+
+    async fn wait_lost(&self) {
+        loop {
+            // Register the notification before checking the flag. Otherwise
+            // the heartbeat can set the flag and notify between the check and
+            // creation of the future, leaving the step asleep forever.
+            let notified = self.notify.notified();
+            if self.is_lost() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn stop(mut self) -> bool {
+        let lost = self.is_lost();
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+        lost || self.is_lost()
+    }
 }
 
 /// Execute a workflow run sequentially.
@@ -1052,10 +1182,10 @@ pub struct ExecutionResult {
 /// 3. Dispatches the action.
 /// 4. Stores the step output for use by later steps.
 ///
-/// On `RequestApproval`: returns `ExecutionResult` with `approval_token = Some(token)`.
+/// On `RequestApproval`: returns `ExecutionResult` with `approval = Some(...)`.
 /// Caller must persist the approval record and update the run status.
 ///
-/// Returns `ExecutionResult` with `approval_token = None` on normal completion.
+/// Returns `ExecutionResult` with `approval = None` on normal completion.
 ///
 /// Enforces `engine.config.max_concurrent` via a semaphore — returns
 /// [`WorkflowError::CapacityExceeded`] immediately if all permits are taken.
@@ -1075,25 +1205,34 @@ pub async fn execute_run(
         )
     })?;
 
-    engine
+    let lease = engine
         .db
-        .update_workflow_run(
-            community_id,
-            run_id,
-            buzz_db::workflow::RunStatus::Running,
-            0,
-            &serde_json::json!([]),
-            None,
-        )
+        .claim_workflow_run_for_execution(community_id, run_id, 0)
         .await
         .map_err(|e| {
             (
                 WorkflowError::from(e),
                 crate::error::PartialProgress::default(),
             )
+        })?
+        .ok_or_else(|| {
+            (
+                WorkflowError::RunAlreadyClaimed,
+                crate::error::PartialProgress::default(),
+            )
         })?;
 
-    execute_steps(engine, community_id, run_id, def, trigger_ctx, 0, None).await
+    execute_claimed_steps(
+        engine,
+        community_id,
+        run_id,
+        def,
+        trigger_ctx,
+        0,
+        None,
+        lease,
+    )
+    .await
 }
 
 /// Resume execution from a specific step index (used for approval resume).
@@ -1125,37 +1264,26 @@ pub async fn execute_from_step(
         )
     })?;
 
-    // Mark run as Running now that we have a permit (resume from approval).
-    // Preserve the existing execution trace from pre-approval steps.
-    let existing_trace = match engine.db.get_workflow_run(community_id, run_id).await {
-        Ok(r) => r.execution_trace,
-        Err(e) => {
-            warn!(
-                run_id = %run_id,
-                "Failed to read existing trace for resume — pre-approval trace will be lost: {e}"
-            );
-            serde_json::json!([])
-        }
-    };
-    engine
+    // Claim the run with a compare-and-set. This is the single-winner guard
+    // for both a replayed approval command and startup recovery.
+    let lease = engine
         .db
-        .update_workflow_run(
-            community_id,
-            run_id,
-            buzz_db::workflow::RunStatus::Running,
-            start_index as i32,
-            &existing_trace,
-            None,
-        )
+        .claim_workflow_run_for_execution(community_id, run_id, start_index as i32)
         .await
         .map_err(|e| {
             (
-                WorkflowError::from(e),
+                WorkflowError::ResumeUnavailable(e.to_string()),
+                crate::error::PartialProgress::default(),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                WorkflowError::RunAlreadyClaimed,
                 crate::error::PartialProgress::default(),
             )
         })?;
 
-    execute_steps(
+    execute_claimed_steps(
         engine,
         community_id,
         run_id,
@@ -1163,6 +1291,40 @@ pub async fn execute_from_step(
         trigger_ctx,
         start_index,
         initial_outputs,
+        lease,
+    )
+    .await
+}
+
+/// Execute from a lease already claimed by an approval handler/recovery
+/// worker. This lets the caller fence the approval-output write before any
+/// step can resume.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_from_claimed_step(
+    engine: &WorkflowEngine,
+    community_id: CommunityId,
+    run_id: Uuid,
+    def: &WorkflowDef,
+    trigger_ctx: &TriggerContext,
+    start_index: usize,
+    initial_outputs: Option<HashMap<String, JsonValue>>,
+    lease: buzz_db::workflow::WorkflowExecutionLease,
+) -> Result<ExecutionResult, (WorkflowError, crate::error::PartialProgress)> {
+    let _permit = engine.run_semaphore.try_acquire().map_err(|_| {
+        (
+            WorkflowError::CapacityExceeded,
+            crate::error::PartialProgress::default(),
+        )
+    })?;
+    execute_claimed_steps(
+        engine,
+        community_id,
+        run_id,
+        def,
+        trigger_ctx,
+        start_index,
+        initial_outputs,
+        lease,
     )
     .await
 }
@@ -1173,6 +1335,54 @@ pub async fn execute_from_step(
 ///
 /// On error, returns `(WorkflowError, PartialProgress)` so callers can persist
 /// the trace of steps completed before the failure.
+#[allow(clippy::too_many_arguments)]
+async fn execute_claimed_steps(
+    engine: &WorkflowEngine,
+    community_id: CommunityId,
+    run_id: Uuid,
+    def: &WorkflowDef,
+    trigger_ctx: &TriggerContext,
+    start_index: usize,
+    initial_outputs: Option<HashMap<String, JsonValue>>,
+    lease: buzz_db::workflow::WorkflowExecutionLease,
+) -> Result<ExecutionResult, (WorkflowError, crate::error::PartialProgress)> {
+    let heartbeat = LeaseHeartbeat::start(engine, community_id, run_id, lease.claim_token).await;
+    let result = execute_steps(
+        engine,
+        community_id,
+        run_id,
+        def,
+        trigger_ctx,
+        start_index,
+        initial_outputs,
+        lease.claim_token,
+        &heartbeat,
+    )
+    .await;
+    if heartbeat.stop().await {
+        return match result {
+            Ok(completed) => Err((
+                WorkflowError::LeaseLost,
+                crate::error::PartialProgress {
+                    step_index: completed.step_index,
+                    trace: completed.trace,
+                    claim_token: Some(lease.claim_token),
+                },
+            )),
+            Err((_error, progress)) => Err((
+                WorkflowError::LeaseLost,
+                crate::error::PartialProgress {
+                    step_index: progress.step_index,
+                    trace: progress.trace,
+                    claim_token: Some(lease.claim_token),
+                },
+            )),
+        };
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn execute_steps(
     engine: &WorkflowEngine,
     community_id: CommunityId,
@@ -1181,6 +1391,8 @@ async fn execute_steps(
     trigger_ctx: &TriggerContext,
     start_index: usize,
     initial_outputs: Option<HashMap<String, JsonValue>>,
+    claim_token: Uuid,
+    heartbeat: &LeaseHeartbeat,
 ) -> Result<ExecutionResult, (WorkflowError, crate::error::PartialProgress)> {
     let mut step_outputs: HashMap<String, JsonValue> = initial_outputs.unwrap_or_default();
     let mut trace: Vec<JsonValue> = Vec::new();
@@ -1209,6 +1421,7 @@ async fn execute_steps(
                     let progress = crate::error::PartialProgress {
                         step_index: i,
                         trace,
+                        claim_token: Some(claim_token),
                     };
                     return Err((e, progress));
                 }
@@ -1221,6 +1434,7 @@ async fn execute_steps(
                 let progress = crate::error::PartialProgress {
                     step_index: i,
                     trace,
+                    claim_token: Some(claim_token),
                 };
                 return Err((e, progress));
             }
@@ -1229,32 +1443,53 @@ async fn execute_steps(
         let timeout_secs = step
             .timeout_secs
             .unwrap_or(engine.config.default_timeout_secs);
-        let dispatch_result = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            dispatch_action(
-                step,
-                &resolved_action,
-                engine,
-                community_id,
-                run_id,
-                trigger_ctx,
-            ),
-        )
-        .await;
+        let renewed = !heartbeat.is_lost()
+            && engine
+                .db
+                .renew_workflow_run_lease(community_id, run_id, claim_token)
+                .await
+                .unwrap_or(false);
+        if !renewed {
+            return Err((
+                WorkflowError::LeaseLost,
+                crate::error::PartialProgress {
+                    step_index: i,
+                    trace,
+                    claim_token: Some(claim_token),
+                },
+            ));
+        }
+
+        let dispatch_result = tokio::select! {
+            result = tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                dispatch_action(
+                    step,
+                    &resolved_action,
+                    engine,
+                    community_id,
+                    run_id,
+                    trigger_ctx,
+                ),
+            ) => Some(result),
+            _ = heartbeat.wait_lost() => None,
+        };
 
         let result = match dispatch_result {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
+            Some(Ok(Ok(r))) => r,
+            Some(Ok(Err(e))) => {
                 let progress = crate::error::PartialProgress {
                     step_index: i,
                     trace,
+                    claim_token: Some(claim_token),
                 };
                 return Err((e, progress));
             }
-            Err(_timeout) => {
+            Some(Err(_timeout)) => {
                 let progress = crate::error::PartialProgress {
                     step_index: i,
                     trace,
+                    claim_token: Some(claim_token),
                 };
                 return Err((
                     WorkflowError::StepTimeout {
@@ -1264,7 +1499,34 @@ async fn execute_steps(
                     progress,
                 ));
             }
+            None => {
+                return Err((
+                    WorkflowError::LeaseLost,
+                    crate::error::PartialProgress {
+                        step_index: i,
+                        trace,
+                        claim_token: Some(claim_token),
+                    },
+                ));
+            }
         };
+
+        if heartbeat.is_lost()
+            || !engine
+                .db
+                .renew_workflow_run_lease(community_id, run_id, claim_token)
+                .await
+                .unwrap_or(false)
+        {
+            return Err((
+                WorkflowError::LeaseLost,
+                crate::error::PartialProgress {
+                    step_index: i,
+                    trace,
+                    claim_token: Some(claim_token),
+                },
+            ));
+        }
 
         match result {
             StepResult::Completed(output) => {
@@ -1276,18 +1538,24 @@ async fn execute_steps(
                 }));
                 step_outputs.insert(step.id.clone(), output);
             }
-            StepResult::Suspended { approval_token } => {
+            StepResult::Suspended { approval } => {
                 info!(
                     run_id = %run_id, step = %step.id,
                     "Step suspended — awaiting approval (token: <redacted>)"
                 );
-                // Return the token and current state so the caller can persist the
-                // approval record and update the run's execution trace.
+                trace.push(serde_json::json!({
+                    "step_id": step.id,
+                    "status": "waiting_approval",
+                    "output": { "approved": null },
+                }));
+                // Return the approval metadata and current state so the caller
+                // can persist the request and update the run's execution trace.
                 return Ok(ExecutionResult {
-                    approval_token: Some(approval_token),
+                    approval: Some(approval),
                     step_index: i,
                     step_outputs,
                     trace,
+                    claim_token,
                 });
             }
             StepResult::Skipped => {
@@ -1302,10 +1570,11 @@ async fn execute_steps(
 
     info!(run_id = %run_id, "Workflow run completed");
     Ok(ExecutionResult {
-        approval_token: None,
+        approval: None,
         step_index: def.steps.len(),
         step_outputs,
         trace,
+        claim_token,
     })
 }
 
@@ -1565,6 +1834,17 @@ mod tests {
     fn parse_duration_minutes() {
         assert_eq!(parse_duration_secs("5m").unwrap(), 300);
         assert_eq!(parse_duration_secs("30m").unwrap(), 1800);
+    }
+
+    #[test]
+    fn approval_timeout_defaults_and_rejects_zero() {
+        assert_eq!(approval_timeout_secs(None).unwrap(), 86_400);
+        assert!(approval_timeout_secs(Some("0s")).is_err());
+    }
+
+    #[test]
+    fn approval_timeout_rejects_overflow() {
+        assert!(approval_timeout_secs(Some("18446744073709551615s")).is_err());
     }
 
     #[test]

@@ -4,6 +4,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "Docker Compose v2 is required (docker compose or docker-compose)." >&2
+  exit 1
+fi
+
 COMPOSE_FILES=(-f compose.yml)
 if [[ "${BUZZ_COMPOSE_TLS:-false}" == "true" ]]; then
   COMPOSE_FILES+=(-f compose.caddy.yml)
@@ -13,7 +22,7 @@ if [[ "${BUZZ_COMPOSE_DEV:-false}" == "true" ]]; then
 fi
 
 compose() {
-  docker compose --env-file .env "${COMPOSE_FILES[@]}" "$@"
+  "${COMPOSE[@]}" --env-file .env "${COMPOSE_FILES[@]}" "$@"
 }
 
 require_env() {
@@ -30,6 +39,16 @@ MSG
     cat >&2 <<'MSG'
 deploy/compose/.env still contains CHANGE_ME placeholders.
 Generate stable secrets first; these values must not rotate on restart.
+MSG
+    exit 1
+  fi
+
+  local image
+  image="$(awk -F= '$1 == "BUZZ_IMAGE" { print substr($0, index($0, "=") + 1); exit }' .env)"
+  if [[ ! "${image}" =~ ^[^@]+@sha256:[0-9a-f]{64}$ ]]; then
+    cat >&2 <<'MSG'
+deploy/compose/.env must pin BUZZ_IMAGE to an immutable sha256 digest.
+Floating tags such as :main, :latest, and semver tags are not permitted for production.
 MSG
     exit 1
   fi

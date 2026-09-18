@@ -67,7 +67,13 @@ async fn authorize_workflow_read(
         event_id_bytes,
         signed_created_at,
     } = bridge::verify_bridge_auth(headers, "GET", &url, None, state.config.require_auth_token)?;
-    bridge::enforce_http_admission(state, &tenant, &pubkey).await?;
+    bridge::enforce_http_admission(
+        state,
+        &tenant,
+        &pubkey,
+        bridge::HttpAdmissionRoute::SharedOnly,
+    )
+    .await?;
     bridge::check_nip98_replay(state, &tenant, event_id_bytes).await?;
 
     let pubkey_bytes = pubkey.to_bytes().to_vec();

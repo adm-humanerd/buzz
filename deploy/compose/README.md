@@ -27,7 +27,7 @@ keypair.
 
 - Requires Docker Compose v2.24.4 or newer; the TLS override uses Compose's
   `!reset` tag to remove the direct relay port when Caddy terminates HTTPS.
-- Default `BUZZ_IMAGE` tracks `ghcr.io/block/buzz:main` for early testing. Pin it to `ghcr.io/block/buzz:sha-<7>` or a semver release tag for production once available.
+- `BUZZ_IMAGE` must be pinned to an immutable OCI digest (`repository@sha256:...`); floating tags such as `:main`, `:latest`, or semver tags are rejected by `run.sh`.
 - Keep `BUZZ_RELAY_PRIVATE_KEY`, `BUZZ_GIT_HOOK_HMAC_SECRET`, database/Redis,
   and S3 secrets stable across restarts.
 - `RELAY_OWNER_PUBKEY` is intentionally not prefixed with `BUZZ_`; it must be a
@@ -49,6 +49,37 @@ keypair.
   such as new Railway Storage Buckets that require `virtual` addressing.
 
 Run `./run.sh backup-hint` for the backup checklist.
+
+## Backup and restore verification
+
+Use the Postgres client from the same major version as the server. Capture the
+Postgres dump and the object/git volumes from one maintenance window; do not
+call a backup complete when only Postgres was captured.
+
+```bash
+# Postgres custom-format backup and catalog inspection.
+docker compose exec -T postgres sh -ec \
+  'pg_dump --format=custom --no-owner -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+  > backups/buzz-$(date -u +%Y%m%dT%H%M%SZ).dump
+pg_restore --list backups/buzz-*.dump
+sha256sum backups/buzz-*.dump > backups/SHA256SUMS
+```
+
+Restore drills MUST target a disposable database or isolated Compose project.
+Never restore over the live database as a test. After restoring, compare event
+and audit-row counts and verify each tenant chain with the operator CLI:
+
+```bash
+DATABASE_URL="$RESTORED_DATABASE_URL" buzz-admin verify-audit \
+  --community-id "$COMMUNITY_ID" --from-seq 1 --to-seq 100000
+```
+
+For chains longer than 100,000 entries, verify contiguous 100,000-entry ranges
+until the final sequence.
+
+A successful `pg_restore` is not sufficient: the restored audit chain must
+verify and the restored object/git volume manifests must match the backup
+checksums. A failed verification is a restore failure and must block rollout.
 
 ## Validation
 

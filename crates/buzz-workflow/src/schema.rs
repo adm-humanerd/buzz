@@ -274,6 +274,14 @@ impl WorkflowDef {
             }
         }
 
+        for step in &self.steps {
+            if let ActionDef::RequestApproval { timeout, .. } = &step.action {
+                crate::executor::approval_timeout_secs(timeout.as_deref()).map_err(|error| {
+                    WorkflowError::InvalidDefinition(format!("step '{}': {error}", step.id))
+                })?;
+            }
+        }
+
         Ok(())
     }
 }
@@ -439,6 +447,13 @@ mod tests {
         );
         let (def, _) = parse_yaml(yaml).expect("parse failed");
         assert_eq!(def.steps.len(), 3);
+    }
+
+    #[test]
+    fn parse_rejects_zero_approval_timeout() {
+        let yaml = "name: Approval\ntrigger:\n  on: webhook\nsteps:\n  - id: gate\n    action: request_approval\n    from: any\n    message: Approve?\n    timeout: 0s\n";
+        let error = parse_yaml(yaml).expect_err("zero approval timeout must be rejected");
+        assert!(matches!(error, WorkflowError::InvalidDefinition(_)));
     }
 
     #[test]

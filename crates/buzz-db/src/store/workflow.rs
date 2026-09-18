@@ -28,6 +28,13 @@ pub const LIST_DEFAULT_LIMIT: i64 = 100;
 /// Hard cap on rows returned by list queries.
 pub const LIST_MAX_LIMIT: i64 = 1000;
 
+/// Maximum lifetime of an execution lease before a healthy worker renews it.
+///
+/// The executor renews this lease while a step is running. Keeping the value
+/// finite lets a crashed approval continuation become recoverable without
+/// allowing a stale worker to retain ownership indefinitely.
+pub const WORKFLOW_EXECUTION_LEASE_SECS: i64 = 30;
+
 /// SHA-256 hash of a raw approval token. Returns the 32-byte digest.
 ///
 /// Approval tokens are stored hashed so that a DB read does not expose
@@ -269,6 +276,24 @@ pub struct ApprovalRecord {
     pub expires_at: DateTime<Utc>,
     /// When the approval record was created.
     pub created_at: DateTime<Utc>,
+}
+
+/// An approval whose run needs recovery (materialization or continuation).
+#[derive(Debug, Clone)]
+pub struct ApprovalRecoveryRecord {
+    /// Community that owns the approval and run.
+    pub community_id: CommunityId,
+    /// Durable approval metadata.
+    pub approval: ApprovalRecord,
+}
+
+/// Durable ownership returned when a workflow run is claimed for execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkflowExecutionLease {
+    /// Unique fence held by the worker that owns the run.
+    pub claim_token: Uuid,
+    /// Database timestamp at which the lease expires unless renewed.
+    pub lease_until: DateTime<Utc>,
 }
 
 // -- Workflow CRUD ------------------------------------------------------------
@@ -963,9 +988,455 @@ pub async fn update_workflow_run(
     Ok(())
 }
 
+/// Update a run only while the caller still owns its execution lease.
+///
+/// `false` means the worker is stale or the run was already finalized. It is
+/// deliberately not an error: losing a lease must not let an old worker
+/// overwrite the winner's trace or terminal result.
+#[allow(clippy::too_many_arguments)]
+pub async fn update_workflow_run_fenced(
+    pool: &PgPool,
+    community_id: CommunityId,
+    id: Uuid,
+    claim_token: Uuid,
+    status: RunStatus,
+    current_step: i32,
+    trace: &serde_json::Value,
+    failure: Option<WorkflowRunFailure<'_>>,
+) -> Result<bool> {
+    let status_str = status.to_string();
+    let (error_code, error) = failure
+        .map(|failure| (Some(failure.code), Some(failure.message)))
+        .unwrap_or((None, None));
+    let affected = sqlx::query(
+        r#"
+        UPDATE workflow_runs
+        SET status = $1::run_status,
+            current_step = $2,
+            execution_trace = $3,
+            error_code = $4,
+            error_message = $5,
+            started_at = CASE WHEN $6 = 'running' AND started_at IS NULL
+                              THEN NOW() ELSE started_at END,
+            completed_at = CASE WHEN $7 IN ('completed', 'failed', 'cancelled')
+                                THEN NOW() ELSE completed_at END,
+            execution_claim_token = CASE WHEN $7 IN ('completed', 'failed', 'cancelled')
+                                         THEN NULL ELSE execution_claim_token END,
+            execution_lease_until = CASE WHEN $7 IN ('completed', 'failed', 'cancelled')
+                                         THEN NULL ELSE execution_lease_until END
+        WHERE community_id = $8 AND id = $9 AND execution_claim_token = $10
+          AND execution_lease_until > NOW()
+        "#,
+    )
+    .bind(&status_str)
+    .bind(current_step)
+    .bind(trace)
+    .bind(error_code)
+    .bind(error)
+    .bind(&status_str)
+    .bind(&status_str)
+    .bind(community_id.as_uuid())
+    .bind(id)
+    .bind(claim_token)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected > 0)
+}
+
+/// Durably record the approval gate and suspended trace while retaining the
+/// execution lease. A second transaction moves the run to `waiting_approval`.
+/// Keeping this intent committed first means a crash between those operations
+/// leaves enough state for the recovery worker to finish the suspension.
+pub async fn prepare_approval_intent(
+    pool: &PgPool,
+    params: CreateApprovalParams<'_>,
+    current_step: i32,
+    trace: &serde_json::Value,
+    claim_token: Uuid,
+) -> Result<bool> {
+    let CreateApprovalParams {
+        community_id,
+        token,
+        workflow_id,
+        run_id,
+        step_id,
+        step_index,
+        approver_spec,
+        expires_at,
+    } = params;
+    let token_hash = hash_approval_token(token);
+    let mut tx = pool.begin().await?;
+
+    let run_updated = sqlx::query(
+        r#"
+        UPDATE workflow_runs
+        SET current_step = $1, execution_trace = $2,
+            error_code = NULL, error_message = NULL
+        WHERE community_id = $3 AND id = $4 AND workflow_id = $5 AND status = 'running'
+          AND execution_claim_token = $6 AND execution_lease_until > NOW()
+        "#,
+    )
+    .bind(current_step)
+    .bind(trace)
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(workflow_id)
+    .bind(claim_token)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
+    if run_updated == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO workflow_approvals
+            (community_id, token, workflow_id, run_id, step_id, step_index, approver_spec, status, expires_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)
+        ON CONFLICT (community_id, token) DO NOTHING
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(token_hash)
+    .bind(workflow_id)
+    .bind(run_id)
+    .bind(step_id)
+    .bind(step_index)
+    .bind(approver_spec)
+    .bind(expires_at)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Atomically persist an approval request and move its run into
+/// `waiting_approval`. The transaction guarantees that a crash cannot leave a
+/// visible approval without the corresponding suspended run trace.
+pub async fn persist_approval_and_waiting_run(
+    pool: &PgPool,
+    params: CreateApprovalParams<'_>,
+    current_step: i32,
+    trace: &serde_json::Value,
+    claim_token: Uuid,
+) -> Result<bool> {
+    let CreateApprovalParams {
+        community_id,
+        token,
+        workflow_id,
+        run_id,
+        step_id,
+        step_index,
+        approver_spec,
+        expires_at,
+    } = params;
+    let token_hash = hash_approval_token(token);
+    let mut tx = pool.begin().await?;
+
+    let run_updated = sqlx::query(
+        r#"
+        UPDATE workflow_runs
+        SET status = 'waiting_approval', current_step = $1, execution_trace = $2,
+            error_code = NULL, error_message = NULL,
+            execution_claim_token = NULL, execution_lease_until = NULL
+        WHERE community_id = $3 AND id = $4 AND workflow_id = $5 AND status = 'running'
+          AND execution_claim_token = $6 AND execution_lease_until > NOW()
+        "#,
+    )
+    .bind(current_step)
+    .bind(trace)
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(workflow_id)
+    .bind(claim_token)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
+    if run_updated == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO workflow_approvals
+            (community_id, token, workflow_id, run_id, step_id, step_index, approver_spec, status, expires_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)
+        ON CONFLICT (community_id, token) DO NOTHING
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(token_hash)
+    .bind(workflow_id)
+    .bind(run_id)
+    .bind(step_id)
+    .bind(step_index)
+    .bind(approver_spec)
+    .bind(expires_at)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Claim a pending or approval-waiting run for one executor.
+pub async fn claim_workflow_run_for_execution(
+    pool: &PgPool,
+    community_id: CommunityId,
+    id: Uuid,
+    current_step: i32,
+) -> Result<Option<WorkflowExecutionLease>> {
+    let row = sqlx::query(
+        r#"
+        UPDATE workflow_runs
+        SET status = 'running', current_step = $1,
+            started_at = COALESCE(started_at, NOW()),
+            execution_claim_token = gen_random_uuid(),
+            execution_lease_until = NOW() + ($4 * INTERVAL '1 second')
+        WHERE community_id = $2 AND id = $3
+          AND (
+              (status = 'pending' AND current_step = $1)
+              OR (
+                  status = 'waiting_approval'
+                  AND current_step = $1 - 1
+                  AND EXISTS (
+                      SELECT 1 FROM workflow_approvals a
+                      WHERE a.community_id = workflow_runs.community_id
+                        AND a.workflow_id = workflow_runs.workflow_id
+                        AND a.run_id = workflow_runs.id
+                        AND a.step_index = $1 - 1
+                        AND a.status = 'granted'
+                  )
+              )
+              OR (
+                  status = 'running'
+                  AND (execution_lease_until IS NULL OR execution_lease_until <= NOW())
+                  AND current_step IN ($1, $1 - 1)
+                  AND EXISTS (
+                      SELECT 1 FROM workflow_approvals a
+                      WHERE a.community_id = workflow_runs.community_id
+                        AND a.workflow_id = workflow_runs.workflow_id
+                        AND a.run_id = workflow_runs.id
+                        AND a.step_index = $1 - 1
+                        AND a.status = 'granted'
+                  )
+              )
+          )
+        RETURNING execution_claim_token, execution_lease_until
+        "#,
+    )
+    .bind(current_step)
+    .bind(community_id.as_uuid())
+    .bind(id)
+    .bind(WORKFLOW_EXECUTION_LEASE_SECS)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|row| {
+        Ok(WorkflowExecutionLease {
+            claim_token: row.try_get("execution_claim_token")?,
+            lease_until: row.try_get("execution_lease_until")?,
+        })
+    })
+    .transpose()
+}
+
+/// Renew an active execution lease. A stale or expired token is rejected.
+pub async fn renew_workflow_run_lease(
+    pool: &PgPool,
+    community_id: CommunityId,
+    run_id: Uuid,
+    claim_token: Uuid,
+) -> Result<bool> {
+    let affected = sqlx::query(
+        r#"
+        UPDATE workflow_runs
+        SET execution_lease_until = NOW() + ($1 * INTERVAL '1 second')
+        WHERE community_id = $2 AND id = $3 AND status = 'running'
+          AND execution_claim_token = $4 AND execution_lease_until > NOW()
+        "#,
+    )
+    .bind(WORKFLOW_EXECUTION_LEASE_SECS)
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(claim_token)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected > 0)
+}
+
+/// Set the approval gate output in the waiting run trace.
+pub async fn set_workflow_approval_output(
+    pool: &PgPool,
+    community_id: CommunityId,
+    run_id: Uuid,
+    step_id: &str,
+    approved: bool,
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query(
+        r#"
+        SELECT execution_trace
+        FROM workflow_runs
+        WHERE community_id = $1 AND id = $2 AND status = 'waiting_approval'
+        FOR UPDATE
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let mut trace: serde_json::Value = row.try_get("execution_trace")?;
+    let Some(entries) = trace.as_array_mut() else {
+        return Err(DbError::InvalidData(
+            "workflow execution trace is not an array".into(),
+        ));
+    };
+    let Some(entry) = entries
+        .iter_mut()
+        .rev()
+        .find(|entry| entry.get("step_id").and_then(|value| value.as_str()) == Some(step_id))
+    else {
+        return Err(DbError::NotFound(format!("approval step {step_id}")));
+    };
+    let current_status = entry.get("status").and_then(|value| value.as_str());
+    let resolved_status = if approved { "approved" } else { "denied" };
+    if current_status == Some(resolved_status) {
+        tx.commit().await?;
+        return Ok(true);
+    }
+    if current_status != Some("waiting_approval") {
+        return Ok(false);
+    }
+    entry["status"] = serde_json::json!(if approved { "approved" } else { "denied" });
+    entry["output"] = serde_json::json!({ "approved": approved });
+
+    sqlx::query(
+        "UPDATE workflow_runs SET execution_trace = $1 WHERE community_id = $2 AND id = $3",
+    )
+    .bind(&trace)
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Store a granted approval's output while the continuation worker owns the
+/// run. This is the fenced counterpart used by approval continuations.
+pub async fn set_workflow_approval_output_fenced(
+    pool: &PgPool,
+    community_id: CommunityId,
+    run_id: Uuid,
+    step_id: &str,
+    approved: bool,
+    claim_token: Uuid,
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query(
+        r#"
+        SELECT execution_trace
+        FROM workflow_runs
+        WHERE community_id = $1 AND id = $2 AND status = 'running'
+          AND execution_claim_token = $3 AND execution_lease_until > NOW()
+        FOR UPDATE
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(claim_token)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let mut trace: serde_json::Value = row.try_get("execution_trace")?;
+    let Some(entries) = trace.as_array_mut() else {
+        return Err(DbError::InvalidData(
+            "workflow execution trace is not an array".into(),
+        ));
+    };
+    let Some(entry) = entries
+        .iter_mut()
+        .rev()
+        .find(|entry| entry.get("step_id").and_then(|value| value.as_str()) == Some(step_id))
+    else {
+        return Err(DbError::NotFound(format!("approval step {step_id}")));
+    };
+    let current_status = entry.get("status").and_then(|value| value.as_str());
+    let resolved_status = if approved { "approved" } else { "denied" };
+    if current_status == Some(resolved_status) {
+        tx.commit().await?;
+        return Ok(true);
+    }
+    if current_status != Some("waiting_approval") {
+        return Ok(false);
+    }
+    entry["status"] = serde_json::json!(resolved_status);
+    entry["output"] = serde_json::json!({ "approved": approved });
+
+    let affected = sqlx::query(
+        r#"
+        UPDATE workflow_runs
+        SET execution_trace = $1
+        WHERE community_id = $2 AND id = $3 AND status = 'running'
+          AND execution_claim_token = $4 AND execution_lease_until > NOW()
+        "#,
+    )
+    .bind(&trace)
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(claim_token)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(affected > 0)
+}
+
+/// Cancel a run only if it is still waiting for the approval decision.
+pub async fn cancel_waiting_workflow_run(
+    pool: &PgPool,
+    community_id: CommunityId,
+    run_id: Uuid,
+    failure: WorkflowRunFailure<'_>,
+) -> Result<bool> {
+    let (error_code, error_message) = (failure.code, failure.message);
+    let affected = sqlx::query(
+        r#"
+        UPDATE workflow_runs
+        SET status = 'cancelled', completed_at = NOW(),
+            error_code = $1, error_message = $2
+        WHERE community_id = $3 AND id = $4 AND status = 'waiting_approval'
+        "#,
+    )
+    .bind(error_code)
+    .bind(error_message)
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected > 0)
+}
+
 // -- Approval CRUD ------------------------------------------------------------
 
 /// Parameters for creating a new approval request.
+#[derive(Clone)]
 pub struct CreateApprovalParams<'a> {
     /// Server-resolved community that owns the workflow/run this approval gates.
     pub community_id: CommunityId,
@@ -1091,6 +1562,168 @@ pub async fn get_run_approvals(
     rows.into_iter().map(row_to_approval_record).collect()
 }
 
+/// Find approval intents whose suspension or continuation was not completed.
+pub async fn list_approval_recoveries(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<ApprovalRecoveryRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT a.community_id, a.token, a.workflow_id, a.run_id, a.step_id,
+               a.step_index, a.approver_spec, a.status::text AS status,
+               a.approver_pubkey, a.note, a.expires_at, a.created_at
+        FROM workflow_approvals a
+        JOIN workflow_runs r
+          ON r.community_id = a.community_id AND r.id = a.run_id
+        WHERE (
+              a.status = 'granted'
+              AND (
+                  (r.status = 'waiting_approval' AND r.current_step = a.step_index)
+                  OR (
+                      r.status = 'running'
+                      AND r.current_step IN (a.step_index, a.step_index + 1)
+                      AND (r.execution_lease_until IS NULL OR r.execution_lease_until <= NOW())
+                  )
+              )
+          )
+          OR (
+              a.status IN ('pending', 'denied')
+              AND r.status = 'running'
+              AND r.current_step = a.step_index
+              AND (r.execution_lease_until IS NULL OR r.execution_lease_until <= NOW())
+          )
+        ORDER BY a.created_at
+        LIMIT $1
+        "#,
+    )
+    .bind(limit.clamp(1, LIST_MAX_LIMIT))
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let community_id: Uuid = row.try_get("community_id")?;
+            Ok(ApprovalRecoveryRecord {
+                community_id: CommunityId::from_uuid(community_id),
+                approval: row_to_approval_record(row)?,
+            })
+        })
+        .collect()
+}
+
+/// Finish materializing a pending approval intent after the worker that
+/// prepared it disappeared. The update is fenced by an expired (or legacy
+/// NULL) lease and is atomic with expiry handling.
+pub async fn recover_pending_workflow_approval(
+    pool: &PgPool,
+    community_id: CommunityId,
+    run_id: Uuid,
+    token_hash: &[u8],
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query(
+        r#"
+        SELECT a.expires_at
+        FROM workflow_approvals a
+        JOIN workflow_runs r
+          ON r.community_id = a.community_id AND r.id = a.run_id
+        WHERE a.community_id = $1 AND a.run_id = $2 AND a.token = $3
+          AND a.status IN ('pending', 'denied') AND r.status = 'running'
+          AND (r.execution_lease_until IS NULL OR r.execution_lease_until <= NOW())
+        FOR UPDATE OF a, r
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(token_hash)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let expires_at: DateTime<Utc> = row.try_get("expires_at")?;
+    let status: String = sqlx::query_scalar(
+        "SELECT status::text FROM workflow_approvals WHERE community_id = $1 AND run_id = $2 AND token = $3",
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(token_hash)
+    .fetch_one(&mut *tx)
+    .await?;
+    if status == "denied" {
+        sqlx::query(
+            "UPDATE workflow_runs SET status = 'cancelled', completed_at = NOW(), error_code = 'approval_denied', error_message = 'workflow cancelled: approval denied' WHERE community_id = $1 AND id = $2 AND status = 'running'",
+        )
+        .bind(community_id.as_uuid())
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+    } else if expires_at <= Utc::now() {
+        sqlx::query(
+            "UPDATE workflow_approvals SET status = 'expired' WHERE community_id = $1 AND run_id = $2 AND token = $3",
+        )
+        .bind(community_id.as_uuid())
+        .bind(run_id)
+        .bind(token_hash)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE workflow_runs SET status = 'cancelled', completed_at = NOW(), error_code = 'approval_expired', error_message = 'workflow cancelled: approval expired' WHERE community_id = $1 AND id = $2 AND status = 'running'",
+        )
+        .bind(community_id.as_uuid())
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+    } else {
+        sqlx::query(
+            "UPDATE workflow_runs SET status = 'waiting_approval', execution_claim_token = NULL, execution_lease_until = NULL WHERE community_id = $1 AND id = $2 AND status = 'running'",
+        )
+        .bind(community_id.as_uuid())
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Mark expired pending approvals and cancel their waiting runs.
+pub async fn expire_workflow_approvals(pool: &PgPool, _limit: i64) -> Result<u64> {
+    let mut tx = pool.begin().await?;
+    let rows = sqlx::query(
+        r#"
+        WITH candidates AS (
+            SELECT community_id, token, step_index
+            FROM workflow_approvals
+            WHERE status = 'pending' AND expires_at <= NOW()
+            ORDER BY expires_at
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+        ), expired AS (
+            UPDATE workflow_approvals a
+            SET status = 'expired'
+            FROM candidates c
+            WHERE a.community_id = c.community_id AND a.token = c.token
+            RETURNING a.community_id, a.run_id, a.step_index
+        )
+        UPDATE workflow_runs r
+        SET status = 'cancelled', completed_at = NOW(),
+            error_code = 'approval_expired',
+            error_message = 'workflow cancelled: approval expired'
+        FROM expired e
+        WHERE r.community_id = e.community_id AND r.id = e.run_id
+          AND r.status = 'waiting_approval' AND r.current_step = e.step_index
+        "#,
+    )
+    .bind(_limit.clamp(1, LIST_MAX_LIMIT))
+    .execute(&mut *tx)
+    .await?;
+    let affected = rows.rows_affected();
+    tx.commit().await?;
+    Ok(affected)
+}
+
 /// Update an approval's status, approver pubkey, and optional note.
 /// Also stamps `granted_at` or `denied_at` based on the new status.
 ///
@@ -1148,6 +1781,7 @@ pub async fn update_approval_by_stored_hash(
             granted_at      = CASE WHEN $4 = 'granted' THEN NOW() ELSE granted_at END,
             denied_at       = CASE WHEN $5 = 'denied'  THEN NOW() ELSE denied_at  END
         WHERE community_id = $6 AND token = $7 AND status = 'pending'
+          AND expires_at > NOW()
         "#,
     )
     .bind(&status_str)
@@ -1353,6 +1987,183 @@ impl Db {
             failure,
         )
         .await
+    }
+
+    /// Fenced run update used by an execution worker that owns the lease.
+    #[allow(clippy::too_many_arguments)]
+    #[datastore_span(name = "update_workflow_run_fenced", system = "postgresql")]
+    pub async fn update_workflow_run_fenced(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        claim_token: Uuid,
+        status: crate::workflow::RunStatus,
+        current_step: i32,
+        trace: &serde_json::Value,
+        failure: Option<crate::workflow::WorkflowRunFailure<'_>>,
+    ) -> Result<bool> {
+        crate::workflow::update_workflow_run_fenced(
+            &self.pool,
+            community_id,
+            id,
+            claim_token,
+            status,
+            current_step,
+            trace,
+            failure,
+        )
+        .await
+    }
+
+    /// Durably record an approval intent and its suspended execution trace.
+    #[datastore_span(name = "prepare_approval_intent", system = "postgresql")]
+    pub async fn prepare_approval_intent(
+        &self,
+        params: crate::workflow::CreateApprovalParams<'_>,
+        current_step: i32,
+        trace: &serde_json::Value,
+        claim_token: Uuid,
+    ) -> Result<bool> {
+        crate::workflow::prepare_approval_intent(
+            &self.pool,
+            params,
+            current_step,
+            trace,
+            claim_token,
+        )
+        .await
+    }
+
+    /// Atomically persist an approval and suspend its workflow run.
+    #[datastore_span(name = "persist_approval_and_waiting_run", system = "postgresql")]
+    pub async fn persist_approval_and_waiting_run(
+        &self,
+        params: crate::workflow::CreateApprovalParams<'_>,
+        current_step: i32,
+        trace: &serde_json::Value,
+        claim_token: Uuid,
+    ) -> Result<bool> {
+        crate::workflow::persist_approval_and_waiting_run(
+            &self.pool,
+            params,
+            current_step,
+            trace,
+            claim_token,
+        )
+        .await
+    }
+
+    /// Claim a pending or approval-waiting run for one executor.
+    #[datastore_span(name = "claim_workflow_run_for_execution", system = "postgresql")]
+    pub async fn claim_workflow_run_for_execution(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        current_step: i32,
+    ) -> Result<Option<crate::workflow::WorkflowExecutionLease>> {
+        crate::workflow::claim_workflow_run_for_execution(
+            &self.pool,
+            community_id,
+            id,
+            current_step,
+        )
+        .await
+    }
+
+    /// Renew a workflow execution lease while a step is active.
+    #[datastore_span(name = "renew_workflow_run_lease", system = "postgresql")]
+    pub async fn renew_workflow_run_lease(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        claim_token: Uuid,
+    ) -> Result<bool> {
+        crate::workflow::renew_workflow_run_lease(&self.pool, community_id, run_id, claim_token)
+            .await
+    }
+
+    /// Store the resolved approval output in a waiting run's trace.
+    #[datastore_span(name = "set_workflow_approval_output", system = "postgresql")]
+    pub async fn set_workflow_approval_output(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        step_id: &str,
+        approved: bool,
+    ) -> Result<bool> {
+        crate::workflow::set_workflow_approval_output(
+            &self.pool,
+            community_id,
+            run_id,
+            step_id,
+            approved,
+        )
+        .await
+    }
+
+    /// Store approval output while holding the execution lease.
+    #[datastore_span(name = "set_workflow_approval_output_fenced", system = "postgresql")]
+    pub async fn set_workflow_approval_output_fenced(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        step_id: &str,
+        approved: bool,
+        claim_token: Uuid,
+    ) -> Result<bool> {
+        crate::workflow::set_workflow_approval_output_fenced(
+            &self.pool,
+            community_id,
+            run_id,
+            step_id,
+            approved,
+            claim_token,
+        )
+        .await
+    }
+
+    /// Cancel a run only while it is still waiting for an approval decision.
+    #[datastore_span(name = "cancel_waiting_workflow_run", system = "postgresql")]
+    pub async fn cancel_waiting_workflow_run(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        failure: crate::workflow::WorkflowRunFailure<'_>,
+    ) -> Result<bool> {
+        crate::workflow::cancel_waiting_workflow_run(&self.pool, community_id, run_id, failure)
+            .await
+    }
+
+    /// List resolved approvals whose waiting run needs continuation or cancellation.
+    #[datastore_span(name = "list_approval_recoveries", system = "postgresql")]
+    pub async fn list_approval_recoveries(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<crate::workflow::ApprovalRecoveryRecord>> {
+        crate::workflow::list_approval_recoveries(&self.pool, limit).await
+    }
+
+    /// Materialize a pending approval intent after an expired continuation.
+    #[datastore_span(name = "recover_pending_workflow_approval", system = "postgresql")]
+    pub async fn recover_pending_workflow_approval(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        token_hash: &[u8],
+    ) -> Result<bool> {
+        crate::workflow::recover_pending_workflow_approval(
+            &self.pool,
+            community_id,
+            run_id,
+            token_hash,
+        )
+        .await
+    }
+
+    /// Expire pending approval requests and cancel their waiting runs.
+    #[datastore_span(name = "expire_workflow_approvals", system = "postgresql")]
+    pub async fn expire_workflow_approvals(&self, limit: i64) -> Result<u64> {
+        crate::workflow::expire_workflow_approvals(&self.pool, limit).await
     }
 
     /// Create an approval request.
@@ -2256,6 +3067,334 @@ mod postgres_tests {
         .await
         .expect("create workflow");
         (workflow_id, community)
+    }
+
+    /// The production approval seam keeps the run transition and hashed token
+    /// row in one transaction, then permits exactly one continuation claim.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn approval_persistence_and_claim_are_durable_and_single_winner() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let (workflow_id, _) = make_workflow_in(&pool, community).await;
+        let run_id = create_workflow_run(&pool, community, workflow_id, None, None)
+            .await
+            .expect("create run");
+        let initial_lease = claim_workflow_run_for_execution(&pool, community, run_id, 0)
+            .await
+            .expect("start run")
+            .expect("initial claim");
+
+        let token = format!("approval-{}", Uuid::new_v4());
+        let trace = serde_json::json!([
+            { "step_id": "gate", "status": "waiting_approval", "output": { "approved": null } }
+        ]);
+        persist_approval_and_waiting_run(
+            &pool,
+            CreateApprovalParams {
+                community_id: community,
+                token: &token,
+                workflow_id,
+                run_id,
+                step_id: "gate",
+                step_index: 0,
+                approver_spec: "any",
+                expires_at: Utc::now() + chrono::Duration::hours(1),
+            },
+            0,
+            &trace,
+            initial_lease.claim_token,
+        )
+        .await
+        .expect("persist approval and suspend run");
+
+        let approval = get_approval(&pool, community, &token)
+            .await
+            .expect("load approval");
+        assert_ne!(approval.token, token.as_bytes());
+        assert_eq!(approval.status, ApprovalStatus::Pending);
+        assert_eq!(
+            get_workflow_run(&pool, community, run_id)
+                .await
+                .expect("load waiting run")
+                .status,
+            RunStatus::WaitingApproval
+        );
+
+        assert!(update_approval(
+            &pool,
+            community,
+            &token,
+            ApprovalStatus::Granted,
+            None,
+            Some("approved"),
+        )
+        .await
+        .expect("grant approval"));
+        let continuation_lease = claim_workflow_run_for_execution(&pool, community, run_id, 1)
+            .await
+            .expect("first continuation claim")
+            .expect("continuation claim wins");
+        assert!(set_workflow_approval_output_fenced(
+            &pool,
+            community,
+            run_id,
+            "gate",
+            true,
+            continuation_lease.claim_token,
+        )
+        .await
+        .expect("record gate output"));
+        assert!(
+            claim_workflow_run_for_execution(&pool, community, run_id, 1)
+                .await
+                .expect("second continuation claim")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn approval_intent_recovery_materializes_after_crash() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let (workflow_id, _) = make_workflow_in(&pool, community).await;
+        let run_id = create_workflow_run(&pool, community, workflow_id, None, None)
+            .await
+            .expect("create run");
+        let lease = claim_workflow_run_for_execution(&pool, community, run_id, 0)
+            .await
+            .expect("start run")
+            .expect("initial lease");
+        let token = format!("intent-recovery-{}", Uuid::new_v4());
+        let trace = serde_json::json!([
+            { "step_id": "gate", "status": "waiting_approval", "output": { "approved": null } }
+        ]);
+
+        assert!(prepare_approval_intent(
+            &pool,
+            CreateApprovalParams {
+                community_id: community,
+                token: &token,
+                workflow_id,
+                run_id,
+                step_id: "gate",
+                step_index: 0,
+                approver_spec: "any",
+                expires_at: Utc::now() + chrono::Duration::hours(1),
+            },
+            0,
+            &trace,
+            lease.claim_token,
+        )
+        .await
+        .expect("prepare approval intent"));
+
+        // Simulate a process crash after the intent transaction committed but
+        // before the worker moved the run to waiting_approval.
+        sqlx::query(
+            "UPDATE workflow_runs SET execution_lease_until = NULL WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community.as_uuid())
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .expect("expire execution lease");
+
+        let recoveries = list_approval_recoveries(&pool, 100)
+            .await
+            .expect("list approval recoveries");
+        let recovery = recoveries
+            .into_iter()
+            .find(|recovery| recovery.approval.run_id == run_id)
+            .expect("pending approval intent recovery");
+        assert_eq!(recovery.approval.status, ApprovalStatus::Pending);
+        assert!(recover_pending_workflow_approval(
+            &pool,
+            community,
+            run_id,
+            &recovery.approval.token,
+        )
+        .await
+        .expect("materialize approval intent"));
+        assert_eq!(
+            get_workflow_run(&pool, community, run_id)
+                .await
+                .expect("load recovered run")
+                .status,
+            RunStatus::WaitingApproval
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn expired_approval_continuation_reclaims_and_fences_stale_worker() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let (workflow_id, _) = make_workflow_in(&pool, community).await;
+        let run_id = create_workflow_run(&pool, community, workflow_id, None, None)
+            .await
+            .expect("create run");
+        let initial = claim_workflow_run_for_execution(&pool, community, run_id, 0)
+            .await
+            .expect("initial claim")
+            .expect("initial lease");
+        let token = format!("lease-recovery-{}", Uuid::new_v4());
+        persist_approval_and_waiting_run(
+            &pool,
+            CreateApprovalParams {
+                community_id: community,
+                token: &token,
+                workflow_id,
+                run_id,
+                step_id: "gate",
+                step_index: 0,
+                approver_spec: "any",
+                expires_at: Utc::now() + chrono::Duration::hours(1),
+            },
+            0,
+            &serde_json::json!([
+                { "step_id": "gate", "status": "waiting_approval", "output": { "approved": null } }
+            ]),
+            initial.claim_token,
+        )
+        .await
+        .expect("persist approval");
+        assert!(update_approval(
+            &pool,
+            community,
+            &token,
+            ApprovalStatus::Granted,
+            None,
+            None,
+        )
+        .await
+        .expect("grant approval"));
+
+        let stale = claim_workflow_run_for_execution(&pool, community, run_id, 1)
+            .await
+            .expect("claim continuation")
+            .expect("stale lease");
+        sqlx::query(
+            "UPDATE workflow_runs SET execution_lease_until = NOW() - INTERVAL '1 second' \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community.as_uuid())
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .expect("expire lease");
+
+        let winner = claim_workflow_run_for_execution(&pool, community, run_id, 1)
+            .await
+            .expect("reclaim continuation")
+            .expect("recovery winner");
+        assert_ne!(stale.claim_token, winner.claim_token);
+        assert!(
+            !renew_workflow_run_lease(&pool, community, run_id, stale.claim_token)
+                .await
+                .expect("stale renewal")
+        );
+        assert!(!update_workflow_run_fenced(
+            &pool,
+            community,
+            run_id,
+            stale.claim_token,
+            RunStatus::Completed,
+            2,
+            &serde_json::json!([{ "stale": true }]),
+            None,
+        )
+        .await
+        .expect("stale finalization"));
+        assert!(update_workflow_run_fenced(
+            &pool,
+            community,
+            run_id,
+            winner.claim_token,
+            RunStatus::Completed,
+            2,
+            &serde_json::json!([{ "winner": true }]),
+            None,
+        )
+        .await
+        .expect("winner finalization"));
+        assert_eq!(
+            get_workflow_run(&pool, community, run_id)
+                .await
+                .expect("load finalized run")
+                .status,
+            RunStatus::Completed
+        );
+    }
+
+    /// Expiry is enforced by the approval CAS and the durable expiry sweep,
+    /// not only by a handler's preflight timestamp check.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn expired_approval_cannot_be_granted_and_cancels_waiting_run() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let (workflow_id, _) = make_workflow_in(&pool, community).await;
+        let run_id = create_workflow_run(&pool, community, workflow_id, None, None)
+            .await
+            .expect("create run");
+        let initial_lease = claim_workflow_run_for_execution(&pool, community, run_id, 0)
+            .await
+            .expect("start run")
+            .expect("initial claim");
+        let token = format!("expired-{}", Uuid::new_v4());
+        persist_approval_and_waiting_run(
+            &pool,
+            CreateApprovalParams {
+                community_id: community,
+                token: &token,
+                workflow_id,
+                run_id,
+                step_id: "gate",
+                step_index: 0,
+                approver_spec: "any",
+                expires_at: Utc::now() - chrono::Duration::seconds(1),
+            },
+            0,
+            &serde_json::json!([
+                { "step_id": "gate", "status": "waiting_approval", "output": { "approved": null } }
+            ]),
+            initial_lease.claim_token,
+        )
+        .await
+        .expect("persist expired approval");
+
+        assert!(!update_approval(
+            &pool,
+            community,
+            &token,
+            ApprovalStatus::Granted,
+            None,
+            None,
+        )
+        .await
+        .expect("expired grant CAS"));
+        assert_eq!(
+            expire_workflow_approvals(&pool, 10)
+                .await
+                .expect("expire sweep"),
+            1
+        );
+        assert_eq!(
+            get_approval(&pool, community, &token)
+                .await
+                .expect("load expired approval")
+                .status,
+            ApprovalStatus::Expired
+        );
+        assert_eq!(
+            get_workflow_run(&pool, community, run_id)
+                .await
+                .expect("load cancelled run")
+                .status,
+            RunStatus::Cancelled
+        );
     }
 
     /// Confinement: a duplicate workflow UUID existing in both community A and

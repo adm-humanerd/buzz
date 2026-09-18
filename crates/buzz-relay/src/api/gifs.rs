@@ -23,8 +23,6 @@ use serde_json::Value;
 
 use crate::state::AppState;
 
-use buzz_auth::LimitType;
-
 use super::{api_error, bridge, internal_error, relay_members};
 
 const KLIPY_API_ROOT: &str = "https://api.klipy.com/api/v1/";
@@ -123,6 +121,7 @@ async fn authenticate(
     headers: &HeaderMap,
     path: &str,
     body: &[u8],
+    route: bridge::HttpAdmissionRoute,
 ) -> Result<(buzz_core::TenantContext, nostr::PublicKey), (StatusCode, Json<Value>)> {
     let raw_host = headers
         .get(header::HOST)
@@ -150,7 +149,7 @@ async fn authenticate(
         true,
         true,
     )?;
-    bridge::enforce_http_admission(state, &tenant, &pubkey).await?;
+    bridge::enforce_http_admission(state, &tenant, &pubkey, route).await?;
     bridge::check_nip98_replay(state, &tenant, event_id_bytes).await?;
     relay_members::enforce_relay_membership(
         state,
@@ -178,37 +177,6 @@ async fn send_upstream(
             );
             api_error(StatusCode::BAD_GATEWAY, "GIF provider is unavailable")
         })
-}
-
-async fn enforce_search_admission(
-    state: &AppState,
-    tenant: &buzz_core::TenantContext,
-    pubkey: &nostr::PublicKey,
-) -> Result<(), (StatusCode, Json<Value>)> {
-    let limit = state.auth.config().rate_limits.gif_searches_per_min;
-    match crate::admission::check_principal(
-        state.admission_rate_limiter.as_ref(),
-        tenant,
-        pubkey,
-        LimitType::GifSearches,
-        60,
-        limit,
-    )
-    .await
-    {
-        Ok(()) => Ok(()),
-        Err(crate::admission::AdmissionError::Exceeded { reset_in_secs }) => {
-            metrics::counter!("buzz_gif_search_rejections_total", "reason" => "quota").increment(1);
-            Err(api_error(
-                StatusCode::TOO_MANY_REQUESTS,
-                &format!("rate-limited: GIF search quota exceeded; retry in {reset_in_secs}s"),
-            ))
-        }
-        Err(crate::admission::AdmissionError::Unavailable) => Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "rate-limited: GIF search admission unavailable",
-        )),
-    }
 }
 
 async fn limited_json(response: reqwest::Response) -> Result<Value, (StatusCode, Json<Value>)> {
@@ -272,13 +240,26 @@ pub async fn search(
             "GIF search is not configured",
         ));
     };
-    let (tenant, pubkey) = authenticate(&state, &headers, SEARCH_PATH, &body).await?;
+    let (tenant, pubkey) = authenticate(
+        &state,
+        &headers,
+        SEARCH_PATH,
+        &body,
+        bridge::HttpAdmissionRoute::GifSearchPreflight,
+    )
+    .await?;
     let request: SearchRequest = serde_json::from_slice(&body)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid GIF search JSON"))?;
     validate_text("query", &request.query, 200, true)?;
     validate_text("customer_id", &request.customer_id, 128, false)?;
     validate_text("locale", &request.locale, 32, false)?;
-    enforce_search_admission(&state, &tenant, &pubkey).await?;
+    bridge::enforce_http_route_admission(
+        &state,
+        &tenant,
+        &pubkey,
+        bridge::HttpAdmissionRoute::GifSearch,
+    )
+    .await?;
 
     let endpoint = if request.query.trim().is_empty() {
         "trending"
@@ -324,7 +305,14 @@ pub async fn share(
             "GIF search is not configured",
         ));
     };
-    authenticate(&state, &headers, SHARE_PATH, &body).await?;
+    authenticate(
+        &state,
+        &headers,
+        SHARE_PATH,
+        &body,
+        bridge::HttpAdmissionRoute::SharedOnly,
+    )
+    .await?;
     let request: ShareRequest = serde_json::from_slice(&body)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid GIF share JSON"))?;
     validate_text("slug", &request.slug, 200, false)?;

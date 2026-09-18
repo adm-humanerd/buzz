@@ -75,6 +75,7 @@ pub(crate) async fn enforce_ws_admission(
         ws_limit,
     )
     .await;
+    audit_ws_admission(state, &conn.tenant, &pubkey, msg, &ws_result);
     if !send_admission_result(conn, ws_result, msg) {
         return false;
     }
@@ -94,6 +95,7 @@ pub(crate) async fn enforce_ws_admission(
             message_limit,
         )
         .await;
+        audit_ws_admission(state, &conn.tenant, &pubkey, msg, &message_result);
         // The per-minute message quota only applies to EVENTs, and its
         // rejection must be as correlatable as the burst quota's.
         if !send_admission_result(conn, message_result, msg) {
@@ -102,6 +104,41 @@ pub(crate) async fn enforce_ws_admission(
     }
 
     true
+}
+
+fn audit_ws_admission(
+    state: &AppState,
+    tenant: &buzz_core::TenantContext,
+    pubkey: &nostr::PublicKey,
+    msg: &ClientMessage,
+    result: &Result<(), AdmissionError>,
+) {
+    let Err(AdmissionError::Exceeded {
+        current,
+        limit,
+        reset_in_secs,
+    }) = result
+    else {
+        return;
+    };
+    let route = match msg {
+        ClientMessage::Event(_) => "/ws/events",
+        ClientMessage::Req { .. } => "/ws/query",
+        ClientMessage::Count { .. } => "/ws/count",
+        _ => "/ws",
+    };
+    crate::admission::audit_rate_limit_exceeded(
+        state,
+        tenant,
+        pubkey,
+        crate::admission::RateLimitAudit {
+            route,
+            transport: "websocket",
+            current: *current,
+            limit: *limit,
+            reset_in_secs: *reset_in_secs,
+        },
+    );
 }
 
 /// Forwards an admission verdict to the client, returning whether the frame was
@@ -119,7 +156,7 @@ fn send_admission_result(
     let target = rejection_target_for(msg);
     match result {
         Ok(()) => true,
-        Err(AdmissionError::Exceeded { reset_in_secs }) => {
+        Err(AdmissionError::Exceeded { reset_in_secs, .. }) => {
             metrics::counter!("buzz_admission_rejections_total", "transport" => "websocket", "reason" => "quota").increment(1);
             conn.send(request_rejection_message(
                 target,
@@ -196,7 +233,11 @@ mod tests {
 
         let admitted = send_admission_result(
             &conn,
-            Err(AdmissionError::Exceeded { reset_in_secs: 7 }),
+            Err(AdmissionError::Exceeded {
+                current: 11,
+                limit: 10,
+                reset_in_secs: 7,
+            }),
             &msg,
         );
 
@@ -245,7 +286,11 @@ mod tests {
 
         send_admission_result(
             &conn,
-            Err(AdmissionError::Exceeded { reset_in_secs: 7 }),
+            Err(AdmissionError::Exceeded {
+                current: 11,
+                limit: 10,
+                reset_in_secs: 7,
+            }),
             &msg,
         );
 
@@ -267,7 +312,11 @@ mod tests {
 
         send_admission_result(
             &conn,
-            Err(AdmissionError::Exceeded { reset_in_secs: 7 }),
+            Err(AdmissionError::Exceeded {
+                current: 11,
+                limit: 10,
+                reset_in_secs: 7,
+            }),
             &msg,
         );
 

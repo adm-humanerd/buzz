@@ -397,6 +397,11 @@ CREATE TABLE workflow_runs (
     completed_at        TIMESTAMPTZ,
     error_message       TEXT,
     error_code          TEXT,
+    -- Internal execution fence. These columns are never included in the
+    -- public run JSON/read model. Legacy NULL leases are reclaimable only for
+    -- a matching granted approval continuation.
+    execution_claim_token UUID,
+    execution_lease_until TIMESTAMPTZ,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (community_id, id),
     FOREIGN KEY (community_id, workflow_id)
@@ -405,6 +410,9 @@ CREATE TABLE workflow_runs (
 
 CREATE INDEX idx_workflow_runs_workflow ON workflow_runs (community_id, workflow_id);
 CREATE INDEX idx_workflow_runs_status ON workflow_runs (community_id, status);
+CREATE INDEX idx_workflow_runs_execution_lease
+    ON workflow_runs (community_id, status, execution_lease_until)
+    WHERE status = 'running';
 
 -- ── Workflow approvals ────────────────────────────────────────────────────────
 -- token-hash lookup scoped: approval token grants cannot act on another

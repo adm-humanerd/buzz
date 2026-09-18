@@ -60,6 +60,12 @@ pub enum LimitType {
     Messages,
     /// HTTP REST API calls.
     ApiCalls,
+    /// HTTP bridge event submissions.
+    ApiEvents,
+    /// HTTP bridge queries.
+    ApiQueries,
+    /// HTTP bridge counts.
+    ApiCounts,
     /// Relay-proxied GIF metadata searches.
     GifSearches,
     /// All WebSocket events (broader than `Messages`).
@@ -74,6 +80,9 @@ impl LimitType {
         match self {
             Self::Messages => "msg",
             Self::ApiCalls => "api",
+            Self::ApiEvents => "api_events",
+            Self::ApiQueries => "api_query",
+            Self::ApiCounts => "api_count",
             Self::GifSearches => "gif",
             Self::WsEvents => "ws",
             Self::IpConnections => "conn",
@@ -292,6 +301,22 @@ mod tests {
 
         assert!(gif_key.ends_with(":gif"));
         assert_ne!(gif_key, api_key);
+    }
+
+    #[test]
+    fn bridge_routes_have_independent_quota_keys() {
+        let ctx = fixture_ctx("relay-a.example");
+        let keys = Keys::generate();
+        let event_key = rate_limit_key(&ctx, &keys.public_key(), &LimitType::ApiEvents);
+        let query_key = rate_limit_key(&ctx, &keys.public_key(), &LimitType::ApiQueries);
+        let count_key = rate_limit_key(&ctx, &keys.public_key(), &LimitType::ApiCounts);
+
+        assert!(event_key.ends_with(":api_events"));
+        assert!(query_key.ends_with(":api_query"));
+        assert!(count_key.ends_with(":api_count"));
+        assert_ne!(event_key, query_key);
+        assert_ne!(event_key, count_key);
+        assert_ne!(query_key, count_key);
     }
 
     #[test]

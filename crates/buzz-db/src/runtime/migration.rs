@@ -1375,6 +1375,31 @@ mod postgres_tests {
     }
 
     #[test]
+    fn workflow_execution_leases_are_additive_and_present_in_desired_schema() {
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 46)
+            .expect("workflow lease migration");
+        assert!(migration
+            .sql
+            .as_str()
+            .contains("ADD COLUMN execution_claim_token UUID"));
+        assert!(migration
+            .sql
+            .as_str()
+            .contains("ADD COLUMN execution_lease_until TIMESTAMPTZ"));
+        assert!(migration
+            .sql
+            .as_str()
+            .contains("idx_workflow_runs_execution_lease"));
+
+        let desired_schema = include_str!("../../../../schema/schema.sql");
+        assert!(desired_schema.contains("execution_claim_token UUID"));
+        assert!(desired_schema.contains("execution_lease_until TIMESTAMPTZ"));
+        assert!(desired_schema.contains("CREATE INDEX idx_workflow_runs_execution_lease"));
+    }
+
+    #[test]
     fn push_match_trigger_is_narrowed_to_message_kinds_additively() {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);

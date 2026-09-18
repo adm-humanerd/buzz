@@ -1,6 +1,7 @@
 use buzz_auth::{LimitType, RateLimiter};
 use buzz_core::TenantContext;
 use nostr::PublicKey;
+use tokio::sync::mpsc::error::TrySendError;
 
 // Desktop startup establishes several independent live subscriptions at once.
 // Preserve the configured average rate while allowing that bounded burst. This
@@ -10,7 +11,11 @@ const WS_BURST_WINDOW_SECS: u64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AdmissionError {
-    Exceeded { reset_in_secs: u64 },
+    Exceeded {
+        current: u64,
+        limit: u64,
+        reset_in_secs: u64,
+    },
     Unavailable,
 }
 
@@ -28,11 +33,88 @@ pub(crate) async fn check_principal<L: RateLimiter>(
     {
         Ok(result) if result.allowed => Ok(()),
         Ok(result) => Err(AdmissionError::Exceeded {
+            current: result.current,
+            limit: result.limit,
             reset_in_secs: result.reset_in_secs,
         }),
         Err(error) => {
             tracing::warn!(error = %error, "shared rate-limit admission unavailable");
             Err(AdmissionError::Unavailable)
+        }
+    }
+}
+
+/// Static, bounded details for a quota-rejection audit entry.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RateLimitAudit {
+    /// Route label selected by the server.
+    pub(crate) route: &'static str,
+    /// Transport label selected by the server.
+    pub(crate) transport: &'static str,
+    /// Counter value returned by the limiter.
+    pub(crate) current: u64,
+    /// Configured quota.
+    pub(crate) limit: u64,
+    /// Seconds until the counter resets.
+    pub(crate) reset_in_secs: u64,
+}
+
+/// Enqueue a bounded, sanitized audit record for a quota rejection.
+///
+/// Rate-limit handling is on the request hot path, so this deliberately uses
+/// `try_send`: audit backpressure must never turn into request backpressure.
+/// Callers provide only static route and transport labels; no request body,
+/// token, subscription id, or other client-controlled text enters the entry.
+pub(crate) fn audit_rate_limit_exceeded(
+    state: &crate::state::AppState,
+    tenant: &TenantContext,
+    pubkey: &PublicKey,
+    audit: RateLimitAudit,
+) {
+    let Some(audit_tx) = &state.audit_tx else {
+        return;
+    };
+
+    enqueue_rate_limit_audit(audit_tx, tenant, pubkey, audit);
+}
+
+fn enqueue_rate_limit_audit(
+    audit_tx: &tokio::sync::mpsc::Sender<buzz_audit::NewAuditEntry>,
+    tenant: &TenantContext,
+    pubkey: &PublicKey,
+    audit: RateLimitAudit,
+) {
+    let entry = buzz_audit::NewAuditEntry {
+        community_id: tenant.community(),
+        action: buzz_audit::AuditAction::RateLimitExceeded,
+        actor_pubkey: Some(pubkey.to_bytes().to_vec()),
+        object_id: None,
+        detail: serde_json::json!({
+            "route": audit.route,
+            "current": audit.current,
+            "limit": audit.limit,
+            "reset_in_secs": audit.reset_in_secs,
+            "transport": audit.transport,
+        }),
+    };
+
+    match audit_tx.try_send(entry) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            metrics::counter!("buzz_audit_rate_limit_drops_total", "reason" => "full").increment(1);
+            tracing::warn!(
+                route = audit.route,
+                transport = audit.transport,
+                "rate-limit audit queue full; entry dropped"
+            );
+        }
+        Err(TrySendError::Closed(_)) => {
+            metrics::counter!("buzz_audit_send_errors_total").increment(1);
+            tracing::warn!(
+                route = audit.route,
+                transport = audit.transport,
+                "rate-limit audit channel closed"
+            );
         }
     }
 }
@@ -52,6 +134,7 @@ mod tests {
     use buzz_auth::{AuthError, RateLimitResult, RateLimiter};
     use buzz_core::CommunityId;
     use nostr::Keys;
+    use tokio::sync::mpsc;
     use uuid::Uuid;
 
     use super::*;
@@ -130,7 +213,14 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result, Err(AdmissionError::Exceeded { reset_in_secs: 1 }));
+        assert_eq!(
+            result,
+            Err(AdmissionError::Exceeded {
+                current: 11,
+                limit: 10,
+                reset_in_secs: 1,
+            })
+        );
         assert_eq!(limiter.calls.load(Ordering::Relaxed), 1);
     }
 
@@ -154,5 +244,39 @@ mod tests {
 
         assert_eq!(result, Err(AdmissionError::Unavailable));
         assert_eq!(limiter.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn rate_limit_audit_enqueue_is_bounded_and_non_blocking() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let keys = Keys::generate();
+        let tenant = tenant();
+
+        let audit = RateLimitAudit {
+            route: "/query",
+            transport: "http",
+            current: 11,
+            limit: 10,
+            reset_in_secs: 7,
+        };
+        enqueue_rate_limit_audit(&tx, &tenant, &keys.public_key(), audit);
+        enqueue_rate_limit_audit(
+            &tx,
+            &tenant,
+            &keys.public_key(),
+            RateLimitAudit {
+                current: 12,
+                ..audit
+            },
+        );
+
+        let entry = rx.try_recv().expect("first audit entry is queued");
+        assert_eq!(entry.action, buzz_audit::AuditAction::RateLimitExceeded);
+        assert_eq!(entry.detail["route"], "/query");
+        assert_eq!(entry.detail["current"], 11);
+        assert_eq!(entry.detail["limit"], 10);
+        assert_eq!(entry.detail["reset_in_secs"], 7);
+        assert_eq!(entry.detail["transport"], "http");
+        assert!(rx.try_recv().is_err(), "full audit queue must not grow");
     }
 }

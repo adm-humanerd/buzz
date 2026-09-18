@@ -180,6 +180,13 @@ impl WorkflowEngine {
         }
     }
 
+    /// Return whether an execution permit is currently available without
+    /// reserving one. This is a best-effort preflight for approval recovery;
+    /// the executor still performs the race-safe semaphore acquisition.
+    pub fn execution_capacity_available(&self) -> bool {
+        self.run_semaphore.available_permits() > 0
+    }
+
     /// Get the action sink reference.
     ///
     /// Returns `Err(WorkflowError)` if the sink has not been initialized via
@@ -226,41 +233,129 @@ impl WorkflowEngine {
                 let trace_json = serde_json::Value::Array(full_trace);
                 let step_count = result.step_index as i32;
 
-                if result.approval_token.is_some() {
-                    // Approval gates are not yet implemented (WF-08).
-                    // Fail explicitly rather than creating unreachable WaitingApproval rows.
-                    tracing::warn!(
-                        run_id = %run_id,
-                        step_index = result.step_index,
-                        "Workflow hit approval gate — not yet implemented, marking as failed"
-                    );
-                    if let Err(e) = self
-                        .db
-                        .update_workflow_run(
-                            community_id,
-                            run_id,
-                            RunStatus::Failed,
-                            step_count,
-                            &trace_json,
-                            Some(buzz_db::workflow::WorkflowRunFailure {
-                                code: "approval_not_supported",
-                                message: "approval gates not yet implemented — see WF-08",
-                            }),
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            run_id = %run_id,
-                            "Failed to update run to Failed (approval gate): {e}"
-                        );
+                if let Some(approval) = result.approval {
+                    let claim_token = result.claim_token;
+                    let params = buzz_db::workflow::CreateApprovalParams {
+                        community_id,
+                        token: &approval.token,
+                        workflow_id: match self.db.get_workflow_run(community_id, run_id).await {
+                            Ok(run) => run.workflow_id,
+                            Err(error) => {
+                                tracing::error!(
+                                    run_id = %run_id,
+                                    "Failed to load workflow for approval persistence: {error}"
+                                );
+                                if let Err(db_error) = self
+                                    .db
+                                    .update_workflow_run_fenced(
+                                        community_id,
+                                        run_id,
+                                        claim_token,
+                                        RunStatus::Failed,
+                                        step_count,
+                                        &trace_json,
+                                        Some(buzz_db::workflow::WorkflowRunFailure {
+                                            code: "approval_persistence_failed",
+                                            message: "workflow approval could not be persisted",
+                                        }),
+                                    )
+                                    .await
+                                {
+                                    tracing::error!(
+                                        run_id = %run_id,
+                                        "Failed to mark approval persistence failure: {db_error}"
+                                    );
+                                }
+                                return;
+                            }
+                        },
+                        run_id,
+                        step_id: &approval.step_id,
+                        step_index: result.step_index as i32,
+                        approver_spec: &approval.approver_spec,
+                        expires_at: approval.expires_at,
+                    };
+                    let prepared = 'prepare: {
+                        for attempt in 0..3 {
+                            match self
+                                .db
+                                .prepare_approval_intent(
+                                    params.clone(),
+                                    step_count,
+                                    &trace_json,
+                                    claim_token,
+                                )
+                                .await
+                            {
+                                Ok(true) => break 'prepare true,
+                                Ok(false) => break 'prepare false,
+                                Err(error) if attempt < 2 => {
+                                    tracing::debug!(
+                                        run_id = %run_id,
+                                        attempt = attempt + 1,
+                                        "Transient approval intent failure; retrying: {error}"
+                                    );
+                                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        run_id = %run_id,
+                                        "Failed to durably record workflow approval intent: {error}"
+                                    );
+                                    break 'prepare false;
+                                }
+                            }
+                        }
+                        false
+                    };
+                    if !prepared {
+                        return;
+                    }
+                    for attempt in 0..3 {
+                        match self
+                            .db
+                            .persist_approval_and_waiting_run(
+                                params.clone(),
+                                step_count,
+                                &trace_json,
+                                claim_token,
+                            )
+                            .await
+                        {
+                            Ok(true) => {
+                                break;
+                            }
+                            Ok(false) => {
+                                tracing::debug!(
+                                    run_id = %run_id,
+                                    "Approval persistence ignored because the execution lease is stale"
+                                );
+                                break;
+                            }
+                            Err(error) if attempt < 2 => {
+                                tracing::debug!(
+                                    run_id = %run_id,
+                                    attempt = attempt + 1,
+                                    "Transient approval persistence failure; retrying: {error}"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    run_id = %run_id,
+                                    "Failed to persist workflow approval; continuation remains recoverable: {error}"
+                                );
+                            }
+                        }
                     }
                 } else {
                     tracing::info!(run_id = %run_id, "Workflow run completed");
                     if let Err(e) = self
                         .db
-                        .update_workflow_run(
+                        .update_workflow_run_fenced(
                             community_id,
                             run_id,
+                            result.claim_token,
                             RunStatus::Completed,
                             step_count,
                             &trace_json,
@@ -277,28 +372,39 @@ impl WorkflowEngine {
             }
             Err((e, progress)) => {
                 tracing::error!(run_id = %run_id, "Workflow run failed: {e}");
+                if e.is_recoverable() {
+                    tracing::debug!(
+                        run_id = %run_id,
+                        error_code = e.code(),
+                        "Leaving workflow run recoverable after non-terminal execution outcome"
+                    );
+                    return;
+                }
                 let mut full_trace = prefix;
                 full_trace.extend(progress.trace);
                 let trace_json = serde_json::Value::Array(full_trace);
-                if let Err(db_err) = self
-                    .db
-                    .update_workflow_run(
-                        community_id,
-                        run_id,
-                        RunStatus::Failed,
-                        progress.step_index as i32,
-                        &trace_json,
-                        Some(buzz_db::workflow::WorkflowRunFailure {
-                            code: e.code(),
-                            message: &e.to_string(),
-                        }),
-                    )
-                    .await
-                {
-                    tracing::error!(
-                        run_id = %run_id,
-                        "Failed to update run to Failed: {db_err}"
-                    );
+                if let Some(claim_token) = progress.claim_token {
+                    if let Err(db_err) = self
+                        .db
+                        .update_workflow_run_fenced(
+                            community_id,
+                            run_id,
+                            claim_token,
+                            RunStatus::Failed,
+                            progress.step_index as i32,
+                            &trace_json,
+                            Some(buzz_db::workflow::WorkflowRunFailure {
+                                code: e.code(),
+                                message: &e.to_string(),
+                            }),
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            run_id = %run_id,
+                            "Failed to update run to Failed: {db_err}"
+                        );
+                    }
                 }
             }
         }

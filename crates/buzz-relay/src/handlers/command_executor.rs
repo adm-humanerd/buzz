@@ -1111,8 +1111,16 @@ async fn handle_approval_grant(
     let db = state.db.clone();
 
     tokio::spawn(async move {
-        resume_workflow_after_approval(engine, db, community_id, run_id, workflow_id, resume_index)
-            .await;
+        resume_workflow_after_approval(
+            engine,
+            db,
+            community_id,
+            run_id,
+            workflow_id,
+            approval.step_id,
+            resume_index,
+        )
+        .await;
     });
 
     // 7. Return response
@@ -1220,38 +1228,36 @@ async fn handle_approval_deny(
     let db = state.db.clone();
 
     tokio::spawn(async move {
-        let run = match db.get_workflow_run(community_id, run_id).await {
-            Ok(r) => r,
+        let cancel_msg = format!("workflow cancelled: approval denied by {pubkey_hex}");
+        match db
+            .set_workflow_approval_output(community_id, run_id, &approval.step_id, false)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return,
             Err(e) => {
-                tracing::error!("approval_deny: failed to fetch run {run_id}: {e}");
+                tracing::error!(
+                    "approval_deny: failed to persist gate output for run {run_id}: {e}"
+                );
                 return;
             }
-        };
-
-        if run.status != RunStatus::WaitingApproval {
-            tracing::warn!(
-                "approval_deny: run {run_id} has status '{}', expected 'waiting_approval'",
-                run.status
-            );
-            return;
         }
-
-        let cancel_msg = format!("workflow cancelled: approval denied by {pubkey_hex}");
-        if let Err(e) = db
-            .update_workflow_run(
+        match db
+            .cancel_waiting_workflow_run(
                 community_id,
                 run_id,
-                RunStatus::Cancelled,
-                run.current_step,
-                &run.execution_trace,
-                Some(buzz_db::workflow::WorkflowRunFailure {
+                buzz_db::workflow::WorkflowRunFailure {
                     code: "approval_denied",
                     message: &cancel_msg,
-                }),
+                },
             )
             .await
         {
-            tracing::error!("approval_deny: failed to cancel run {run_id}: {e}");
+            Ok(true) => {}
+            Ok(false) => tracing::warn!("approval_deny: run {run_id} was already claimed"),
+            Err(e) => {
+                tracing::error!("approval_deny: failed to cancel run {run_id}: {e}");
+            }
         }
     });
 
@@ -1276,6 +1282,7 @@ async fn resume_workflow_after_approval(
     community_id: CommunityId,
     run_id: Uuid,
     workflow_id: Uuid,
+    step_id: String,
     resume_index: usize,
 ) {
     let run = match db.get_workflow_run(community_id, run_id).await {
@@ -1286,8 +1293,10 @@ async fn resume_workflow_after_approval(
         }
     };
 
-    // Guard: only resume runs that are actually waiting for approval
-    if run.status != RunStatus::WaitingApproval {
+    // Guard: only resume a waiting run or an expired running continuation.
+    // Normal running workflows are never reclaimable without the matching
+    // granted approval row enforced by the DB claim predicate.
+    if !matches!(run.status, RunStatus::WaitingApproval | RunStatus::Running) {
         tracing::warn!(
             "resume_workflow: run {run_id} has status '{}', expected 'waiting_approval'",
             run.status
@@ -1308,22 +1317,87 @@ async fn resume_workflow_after_approval(
         Ok(d) => d,
         Err(e) => {
             tracing::error!("resume_workflow: failed to parse workflow definition: {e}");
-            if let Err(db_err) = db
-                .update_workflow_run(
+            // Do not write an unfenced terminal result here: another worker
+            // may reclaim this expired continuation while definition parsing
+            // is in progress. The recovery scan will retry the durable grant.
+            return;
+        }
+    };
+
+    // Approval does not grant the workflow owner standing authority. Recheck
+    // the durable owner/channel fence before any post-approval side effect.
+    if let Some(channel_id) = workflow.channel_id {
+        if let Err(error) = engine
+            .check_owner_authority(community_id, channel_id, &workflow.owner_pubkey, &def)
+            .await
+        {
+            tracing::warn!(run_id = %run_id, "resume_workflow: owner authority lost: {error}");
+            if let Err(db_error) = db
+                .cancel_waiting_workflow_run(
                     community_id,
                     run_id,
-                    RunStatus::Failed,
-                    run.current_step,
-                    &run.execution_trace,
-                    Some(buzz_db::workflow::WorkflowRunFailure {
-                        code: "invalid_definition",
-                        message: &format!("definition parse error: {e}"),
-                    }),
+                    buzz_db::workflow::WorkflowRunFailure {
+                        code: "owner_unauthorized",
+                        message: "workflow owner lacks current authority after approval",
+                    },
                 )
                 .await
             {
-                tracing::error!("resume_workflow: failed to mark run as failed: {db_err}");
+                tracing::error!(run_id = %run_id, "resume_workflow: failed to cancel unauthorized run: {db_error}");
             }
+            return;
+        }
+    }
+
+    // Avoid claiming a durable lease when local capacity is already known to
+    // be exhausted. The DB claim remains the final race-safe authority.
+    if !engine.execution_capacity_available() {
+        tracing::debug!(run_id = %run_id, "resume_workflow: local capacity exhausted");
+        return;
+    }
+
+    // Claim the durable continuation before touching the approval trace. A
+    // replay or recovery worker that loses this CAS must not mutate the
+    // winner's trace or later finalize over it.
+    let lease = match db
+        .claim_workflow_run_for_execution(community_id, run_id, resume_index as i32)
+        .await
+    {
+        Ok(Some(lease)) => lease,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(run_id = %run_id, "resume_workflow: claim unavailable: {error}");
+            return;
+        }
+    };
+
+    match db
+        .set_workflow_approval_output_fenced(
+            community_id,
+            run_id,
+            &step_id,
+            true,
+            lease.claim_token,
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            tracing::error!(
+                "resume_workflow: failed to persist approval output for run {run_id}: {e}"
+            );
+            return;
+        }
+    }
+
+    // Reload after the fenced approval-output write. Finalization must prepend
+    // the current trace, not the stale waiting trace fetched before the claim,
+    // or it could overwrite `approved: true` with the old null output.
+    let run = match db.get_workflow_run(community_id, run_id).await {
+        Ok(run) => run,
+        Err(e) => {
+            tracing::error!("resume_workflow: failed to reload run {run_id}: {e}");
             return;
         }
     };
@@ -1351,7 +1425,7 @@ async fn resume_workflow_after_approval(
 
     // Execute remaining steps
     let existing_trace = run.execution_trace.as_array().cloned();
-    let result = buzz_workflow::executor::execute_from_step(
+    let result = buzz_workflow::executor::execute_from_claimed_step(
         &engine,
         community_id,
         run_id,
@@ -1359,11 +1433,83 @@ async fn resume_workflow_after_approval(
         &trigger_ctx,
         resume_index,
         Some(initial_outputs),
+        lease,
     )
     .await;
+
+    // A duplicate recovery task, transient capacity pressure, or a temporary
+    // claim/read failure must leave the durable grant recoverable. In
+    // particular, never let a losing worker overwrite the winner's run with
+    // `failed` after the winner has claimed or completed it.
+    match &result {
+        Err((buzz_workflow::WorkflowError::RunAlreadyClaimed, _)) => {
+            tracing::debug!(run_id = %run_id, "resume_workflow: another worker owns continuation");
+            return;
+        }
+        Err((buzz_workflow::WorkflowError::CapacityExceeded, _))
+        | Err((buzz_workflow::WorkflowError::ResumeUnavailable(_), _)) => {
+            tracing::warn!(run_id = %run_id, "resume_workflow: continuation remains recoverable");
+            return;
+        }
+        _ => {}
+    }
     engine
         .finalize_run(community_id, run_id, result, existing_trace)
         .await;
+}
+
+/// Recover approval continuations that were durably granted before the
+/// detached continuation task was lost. The run-level CAS makes this safe to
+/// invoke concurrently from command handling and periodic recovery.
+pub async fn recover_workflow_approvals(state: &Arc<AppState>) {
+    if let Err(error) = state.db.expire_workflow_approvals(100).await {
+        tracing::warn!("workflow approval expiry sweep failed: {error}");
+    }
+
+    let recoveries = match state.db.list_approval_recoveries(100).await {
+        Ok(recoveries) => recoveries,
+        Err(error) => {
+            tracing::warn!("workflow approval recovery scan failed: {error}");
+            return;
+        }
+    };
+
+    for recovery in recoveries {
+        let engine = Arc::clone(&state.workflow_engine);
+        let db = state.db.clone();
+        let approval = recovery.approval;
+        // Process the bounded scan inline. The next 30s tick cannot create a
+        // second unbounded batch while a database or side-effect sink is slow.
+        if matches!(
+            approval.status,
+            ApprovalStatus::Pending | ApprovalStatus::Denied
+        ) {
+            if let Err(error) = db
+                .recover_pending_workflow_approval(
+                    recovery.community_id,
+                    approval.run_id,
+                    &approval.token,
+                )
+                .await
+            {
+                tracing::warn!(
+                    run_id = %approval.run_id,
+                    "approval intent recovery failed: {error}"
+                );
+            }
+        } else if approval.status == ApprovalStatus::Granted {
+            resume_workflow_after_approval(
+                engine,
+                db,
+                recovery.community_id,
+                approval.run_id,
+                approval.workflow_id,
+                approval.step_id,
+                approval.step_index as usize + 1,
+            )
+            .await;
+        }
+    }
 }
 
 #[cfg(test)]

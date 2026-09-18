@@ -12,6 +12,8 @@ pub struct PartialProgress {
     pub step_index: usize,
     /// Trace entries for steps completed/skipped before the failure.
     pub trace: Vec<serde_json::Value>,
+    /// Fence held by the worker, if execution reached the claim boundary.
+    pub claim_token: Option<uuid::Uuid>,
 }
 
 /// Errors produced by the workflow engine.
@@ -60,6 +62,19 @@ pub enum WorkflowError {
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
+    /// A resume could not claim the durable run yet and should remain
+    /// recoverable rather than being finalized as a workflow failure.
+    #[error("resume unavailable: {0}")]
+    ResumeUnavailable(String),
+
+    /// Another worker already claimed or finished the durable run.
+    #[error("workflow run already claimed or finished")]
+    RunAlreadyClaimed,
+
+    /// The worker lost its durable execution lease and must not finalize.
+    #[error("workflow execution lease lost")]
+    LeaseLost,
+
     /// The action is defined but not yet implemented.
     #[error("action not implemented: {0}")]
     NotImplemented(String),
@@ -78,8 +93,23 @@ impl WorkflowError {
             Self::CapacityExceeded => "capacity_exceeded",
             Self::Database(_) => "database_error",
             Self::Unauthorized(_) => "owner_unauthorized",
+            Self::ResumeUnavailable(_) => "resume_unavailable",
+            Self::RunAlreadyClaimed => "run_already_claimed",
+            Self::LeaseLost => "execution_lease_lost",
             Self::NotImplemented(_) => "action_not_implemented",
         }
+    }
+
+    /// Whether the durable run should remain recoverable instead of being
+    /// finalized as a terminal workflow failure.
+    pub const fn is_recoverable(&self) -> bool {
+        matches!(
+            self,
+            Self::CapacityExceeded
+                | Self::ResumeUnavailable(_)
+                | Self::RunAlreadyClaimed
+                | Self::LeaseLost
+        )
     }
 }
 
@@ -110,5 +140,8 @@ mod tests {
             WorkflowError::NotImplemented("SendDm".to_owned()).code(),
             "action_not_implemented"
         );
+        assert!(WorkflowError::LeaseLost.is_recoverable());
+        assert!(WorkflowError::CapacityExceeded.is_recoverable());
+        assert!(!WorkflowError::InvalidDefinition("bad".to_owned()).is_recoverable());
     }
 }

@@ -183,9 +183,14 @@ async fn authenticate(
         body.is_some(),
     )
     .map_err(IntoResponse::into_response)?;
-    bridge::enforce_http_admission(state, &tenant, &auth.pubkey)
-        .await
-        .map_err(IntoResponse::into_response)?;
+    bridge::enforce_http_admission(
+        state,
+        &tenant,
+        &auth.pubkey,
+        bridge::HttpAdmissionRoute::SharedOnly,
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
     bridge::check_nip98_replay(state, &tenant, auth.event_id_bytes)
         .await
         .map_err(IntoResponse::into_response)?;

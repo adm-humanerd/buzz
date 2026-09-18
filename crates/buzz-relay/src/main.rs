@@ -723,6 +723,20 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
     let wf_cron = Arc::clone(&workflow_engine);
     tokio::spawn(async move { wf_cron.run().await });
 
+    // Resume approvals whose durable grant committed before a continuation
+    // task could be spawned. The same sweep also expires abandoned pending
+    // approvals; all continuation work remains tenant-scoped in the DB.
+    let approval_recovery_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        loop {
+            buzz_relay::handlers::command_executor::recover_workflow_approvals(
+                &approval_recovery_state,
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    });
+
     // Ephemeral channel reaper — archives channels whose TTL deadline has passed.
     // Runs every 60s, matching the workflow cron loop pattern. The SQL UPDATE
     // uses `archived_at IS NULL` as a guard, so concurrent runs from multiple

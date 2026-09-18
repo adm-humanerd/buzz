@@ -37,6 +37,8 @@ use clap::{Parser, Subcommand};
 use nostr::{EventBuilder, Keys, Kind, Tag};
 use tracing::warn;
 
+const MAX_AUDIT_VERIFY_SPAN: i64 = 100_000;
+
 #[derive(Parser)]
 #[command(name = "buzz-admin", about = "Buzz instance administration")]
 struct Cli {
@@ -87,6 +89,20 @@ enum Command {
         /// Abort before folding a page that would exceed this object count.
         #[arg(long, default_value_t = 10_000_000)]
         max_objects: u64,
+    },
+    /// Verify one tenant's append-only audit hash chain.
+    VerifyAudit {
+        /// Server-resolved community UUID to verify.
+        #[arg(long)]
+        community_id: String,
+
+        /// First sequence number to verify (inclusive).
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(i64).range(1..))]
+        from_seq: i64,
+
+        /// Last sequence number to verify (inclusive).
+        #[arg(long, default_value_t = MAX_AUDIT_VERIFY_SPAN, value_parser = clap::value_parser!(i64).range(1..))]
+        to_seq: i64,
     },
     /// Inspect deployment-wide Buzz product feedback.
     ProductFeedback {
@@ -165,6 +181,11 @@ async fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Command::StorageSnapshot { max_objects } => cmd_storage_snapshot(max_objects).await,
+        Command::VerifyAudit {
+            community_id,
+            from_seq,
+            to_seq,
+        } => cmd_verify_audit(community_id, from_seq, to_seq).await,
         Command::AddMember { pubkey, role } => cmd_add_member(pubkey, role).await,
         Command::RemoveMember { pubkey, role } => cmd_remove_member(pubkey, role).await,
         Command::ListMembers => cmd_list_members().await,
@@ -176,6 +197,46 @@ async fn run(cli: Cli) -> Result<i32> {
             reconcile_channels(channel, relay_key).await?;
             Ok(0)
         }
+    }
+}
+
+async fn cmd_verify_audit(community_arg: String, from_seq: i64, to_seq: i64) -> Result<i32> {
+    if from_seq > to_seq {
+        return Err(anyhow::anyhow!("--from-seq must not exceed --to-seq"));
+    }
+    let span = to_seq.saturating_sub(from_seq).saturating_add(1);
+    if span > MAX_AUDIT_VERIFY_SPAN {
+        return Err(anyhow::anyhow!(
+            "audit verification range is limited to {MAX_AUDIT_VERIFY_SPAN} entries"
+        ));
+    }
+    let community_uuid = community_arg
+        .parse::<uuid::Uuid>()
+        .map_err(|e| anyhow::anyhow!("invalid --community-id UUID: {e}"))?;
+    let db_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string());
+    let pool = sqlx::PgPool::connect(&db_url).await?;
+    let service = buzz_audit::AuditService::new(pool);
+    match service
+        .verify_chain(
+            buzz_core::CommunityId::from_uuid(community_uuid),
+            from_seq,
+            to_seq,
+        )
+        .await
+    {
+        Ok(true) => {
+            println!(
+                "audit chain verified: community_id={community_uuid} seq={from_seq}..={to_seq}"
+            );
+            Ok(0)
+        }
+        Ok(false) => Err(anyhow::anyhow!(
+            "audit chain has no entries in community_id={community_uuid} seq={from_seq}..={to_seq}"
+        )),
+        Err(error) => Err(anyhow::anyhow!(
+            "audit chain verification failed for community_id={community_uuid}: {error}"
+        )),
     }
 }
 
